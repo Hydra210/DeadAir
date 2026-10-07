@@ -202,8 +202,8 @@ def access_problem(info: GroupInfo, state: str) -> Optional[str]:
     return {
         "disabled": f"The account isn't in {link} and auto-join is turned off.",
         "locked": f"{link} is locked, so the account can't join it.",
-        "challenge": (f"Roblox asked for a captcha when joining {link}, and a bot can't solve that. "
-                      "Join the group once by hand on the bot's account, then run this again."),
+        "challenge": (f"Roblox asked for a captcha when joining {link}, and the bot can't solve that. "
+                      "Some information will not be viewable."),
         "pending": (f"{link} needs approval. A join request was sent. "
                     "Have someone accept it, then run this again."),
     }.get(state)
