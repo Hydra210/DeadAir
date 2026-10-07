@@ -3,6 +3,7 @@
 # Credits: @Nexesmere / EXE Development
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -23,6 +24,7 @@ CFG = {
     "MaxListPages": 25,         # ~2500 assets, same cap as the extension
     "MaxRetries": 4,
     "MaxAudioBytes": 30_000_000,  # refuse to download anything bigger than this
+    "PlaceId": os.getenv("ROBLOX_PLACE_ID", "1818"),  # sent as Roblox-Place-Id on asset delivery (any public place)
     "JoinCooldownSeconds": 30,  # min gap between group joins so the account doesn't get flagged
 }
 
@@ -108,10 +110,12 @@ class RobloxClient:
 
     # ---------- core request: CSRF retry, 429 backoff, challenge detection ----------
 
-    async def _request(self, method: str, url: str, *, params=None, json=None):
+    async def _request(self, method: str, url: str, *, params=None, json=None, extra_headers=None):
         last_err = "unknown error"
         for attempt in range(CFG["MaxRetries"]):
             headers = {"x-csrf-token": self._csrf} if self._csrf else {}
+            if extra_headers:
+                headers.update(extra_headers)
             try:
                 async with self._session.request(
                     method, url, params=params, json=json, headers=headers
@@ -299,30 +303,42 @@ class RobloxClient:
     # ---------- audio file download ----------
 
     async def audio_download_url(self, asset_id: int) -> str:
-        err = "no download location returned"
-        try:
-            d = await self._request("GET", f"https://assetdelivery.roblox.com/v2/assetId/{asset_id}")
+        """Finds the CDN location of the audio. The first attempt copies what the BTRoblox extension does for
+        audio: GET /v2/asset/?id=... with the cookie and the Roblox-Browser-Asset-Request header."""
+        place = {"Roblox-Place-Id": str(CFG["PlaceId"])}
+        attempts = [
+            ("https://assetdelivery.roblox.com/v2/asset/", {"id": str(asset_id)},
+             {"Roblox-Browser-Asset-Request": "true"}),
+            (f"https://assetdelivery.roblox.com/v2/assetId/{asset_id}", None, place),
+        ]
+        errors = []
+        for url, params, hdrs in attempts:
+            try:
+                d = await self._request("GET", url, params=params, extra_headers=hdrs)
+            except (AuthError, ChallengeRequired):
+                raise
+            except RobloxError as e:
+                errors.append(str(e))
+                continue
             for loc in d.get("locations") or []:
                 if loc.get("location"):
                     return loc["location"]
-        except (AuthError, ChallengeRequired):
-            raise
-        except RobloxError as e:
-            err = str(e)
+            errors.append(str(d.get("errors") or "no download location returned")[:150])
 
         # v1 fallback: it answers with a redirect to the CDN. Don't follow it with our cookie attached.
         try:
             async with self._session.get(
                 "https://assetdelivery.roblox.com/v1/asset/",
                 params={"id": str(asset_id)}, allow_redirects=False,
+                headers={"Roblox-Browser-Asset-Request": "true", **place},
             ) as res:
                 loc = res.headers.get("Location")
                 if res.status in (301, 302, 303, 307, 308) and loc:
                     return loc
-                err = f"{res.status} from asset delivery"
+                errors.append(f"v1 fallback: {res.status}")
         except aiohttp.ClientError as e:
-            err = f"network error: {e}"
-        raise RobloxError(err)
+            errors.append(f"network error: {e}")
+        raise RobloxError(" | ".join(errors))
 
     async def download_audio(self, asset_id: int) -> bytes:
         url = await self.audio_download_url(asset_id)

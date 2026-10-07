@@ -442,6 +442,8 @@ async def check_single(interaction: discord.Interaction, asset_id: int):
             note = (note + "\n" if note else "") + "The file downloaded, but it couldn't be decoded for a waveform."
     elif status != "broken":
         why = "Roblox wouldn't serve the file to this account. It may be moderated, deleted, or private."
+        if dl_err:
+            why += f"\nReason from Roblox: `{dl_err[:200]}`"
         note = (note + "\n" if note else "") + why
     if status == "broken":
         note = (note + "\n" if note else "") + "Roblox flagged this audio as moderated."
