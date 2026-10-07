@@ -85,6 +85,7 @@ class RobloxClient:
         self._join_lock = asyncio.Lock()
         self._last_join = 0.0
         self.user: Optional[dict] = None
+        self.last_skipped = 0
 
     async def start(self):
         self._session = aiohttp.ClientSession(
@@ -206,7 +207,7 @@ class RobloxClient:
     # ---------- audio ----------
 
     async def list_group_audio(self, group_id: int) -> list[dict]:
-        items, cursor, pages = [], "", 0
+        items, cursor, pages, skipped = [], "", 0, 0
         while True:
             params = {"assetType": "Audio", "groupId": str(group_id), "limit": str(CFG["ListPageLimit"])}
             if cursor:
@@ -218,12 +219,16 @@ class RobloxClient:
                 try:
                     if int(it["assetId"]) > 0:
                         items.append(it)
+                    else:
+                        skipped += 1
                 except (KeyError, ValueError, TypeError):
+                    skipped += 1
                     continue
             cursor = data.get("nextPageCursor") or ""
             pages += 1
             if not cursor or pages >= CFG["MaxListPages"]:
                 break
+        self.last_skipped = skipped  # entries with no asset ID yet (still processing)
         return items  # [{ name, assetId }]
 
     async def asset_details(self, asset_ids: list[int]) -> dict[str, dict]:

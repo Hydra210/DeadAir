@@ -547,9 +547,17 @@ async def search(interaction: discord.Interaction, group_id: str, term: str, exa
 
     link = f"[{link_text(info.name)}]({group_url(gid)})"
     if not matched:
+        extra = ""
+        if everything:
+            sample = ", ".join(f"`{link_text(it.get('name'), 30)}`" for it in everything[:5])
+            extra += f"\nFirst names the bot saw: {sample}"
+        skipped = getattr(bot.rbx, "last_skipped", 0)
+        if skipped:
+            extra += (f"\n{skipped} entries were skipped because Roblox hasn't given them an asset ID yet "
+                      "(usually still processing).")
         await show(interaction, make_embed(
             "No matches", f"Nothing matching `{link_text(term, 60)}` in {link} "
-                          f"({len(everything)} audios searched)."))
+                          f"({len(everything)} audios searched).{extra}"))
         return
 
     ids = [int(m["assetId"]) for m in matched]
