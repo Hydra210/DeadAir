@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import discord
+from aiohttp import web
 from discord import app_commands
 from dotenv import load_dotenv
 
@@ -106,8 +107,27 @@ class DeadAir(discord.Client):
         super().__init__(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self)
         self.rbx: Optional[RobloxClient] = None
+        self.health: Optional[web.AppRunner] = None
+
+    async def start_health_server(self):
+        """Tiny HTTP endpoint so Render's free Web Service has a port to check and an uptime pinger can hit it."""
+        port = os.getenv("PORT")
+        if not port:
+            return
+        app = web.Application()
+
+        async def ok(_request):
+            return web.Response(text="ok")
+
+        app.router.add_get("/", ok)
+        app.router.add_get("/health", ok)
+        self.health = web.AppRunner(app)
+        await self.health.setup()
+        await web.TCPSite(self.health, "0.0.0.0", int(port)).start()
+        log.info("Health server listening on port %s", port)
 
     async def setup_hook(self):
+        await self.start_health_server()
         self.rbx = RobloxClient(CFG["Cookie"])
         await self.rbx.start()  # raises if the cookie is dead
         log.info("Roblox account: %s (%s)", self.rbx.user["name"], self.rbx.user["id"])
@@ -122,6 +142,8 @@ class DeadAir(discord.Client):
     async def close(self):
         if self.rbx:
             await self.rbx.close()
+        if self.health:
+            await self.health.cleanup()
         await super().close()
 
 

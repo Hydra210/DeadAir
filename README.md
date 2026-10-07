@@ -41,11 +41,14 @@ The bot downloads the audio file through Roblox's asset delivery and analyzes it
 audio files to accounts that have permission, so audio the bot can't access still gets a card, just without
 length-from-file, loudness stats, or the image. Loudness numbers are peak and average (RMS) in dBFS, not LUFS.
 
-## Deploying on Render
+## Deploying on Render (free)
 
-Use a **Background Worker** (not a Web Service). Push this folder to a private GitHub repo, then
-Render -> New -> Blueprint, which reads `render.yaml`. Fill in `DISCORD_TOKEN` and `ROBLOX_COOKIE`
-in the dashboard.
+Background Workers cost money, so this runs as a free **Web Service**. `bot.py` serves `/health` on the
+port Render provides. Push this folder to a private GitHub repo, then Render -> New -> Web Service
+(or Blueprint, which reads `render.yaml`), and fill in `DISCORD_TOKEN` and `ROBLOX_COOKIE`.
+
+Free web services spin down after 15 minutes without inbound traffic, which would take the bot offline.
+Add a free monitor (UptimeRobot, 5 minute interval) that requests `https://<your-service>.onrender.com/health`.
 
 ## Cookie safety
 

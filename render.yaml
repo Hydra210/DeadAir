@@ -1,12 +1,14 @@
-# Render Blueprint for DeadAir. The bot has no web server, so it's a Background Worker.
+# Render Blueprint for DeadAir. Free Web Service: bot.py also serves /health so Render sees a port
+# and an uptime pinger (UptimeRobot etc.) can keep it from spinning down.
 services:
-  - type: worker
+  - type: web
     name: deadair
     runtime: python
-    plan: starter            # Background Workers have no free tier
+    plan: free
     region: oregon
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
