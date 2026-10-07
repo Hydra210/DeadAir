@@ -22,7 +22,7 @@ by itself. For `/check` it only joins when it can't get the audio otherwise, so 
 2. `pip install -r requirements.txt`
 3. Create a bot at https://discord.com/developers/applications (no privileged intents).
    Invite with scopes `bot` + `applications.commands`.
-4. Copy `.env.example` to `.env`, fill in the token, cookie, and your Discord user ID.
+4. Copy `.env.example` to `.env` and fill in the token and cookie.
 5. `python bot.py`
 
 Cookie: logged into the Roblox alt in a browser, DevTools (F12) -> Application -> Cookies -> roblox.com ->
@@ -44,8 +44,8 @@ length-from-file, loudness stats, or the image. Loudness numbers are peak and av
 ## Deploying on Render
 
 Use a **Background Worker** (not a Web Service). Push this folder to a private GitHub repo, then
-Render -> New -> Blueprint, which reads `render.yaml`. Fill in `DISCORD_TOKEN`, `ROBLOX_COOKIE`,
-`ALLOWED_USER_IDS` in the dashboard.
+Render -> New -> Blueprint, which reads `render.yaml`. Fill in `DISCORD_TOKEN` and `ROBLOX_COOKIE`
+in the dashboard.
 
 ## Cookie safety
 

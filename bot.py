@@ -30,7 +30,6 @@ log = logging.getLogger("deadair")
 CFG = {
     "Token": os.getenv("DISCORD_TOKEN", ""),
     "Cookie": os.getenv("ROBLOX_COOKIE", ""),
-    "AllowedUsers": {int(x) for x in re.findall(r"\d+", os.getenv("ALLOWED_USER_IDS", ""))},
     "AutoJoin": os.getenv("AUTO_JOIN", "true").lower() in ("1", "true", "yes", "on"),
     "DevGuildId": os.getenv("GUILD_ID", ""),   # optional: instant command sync in one server
     "MaxIds": 500,
@@ -129,18 +128,10 @@ class DeadAir(discord.Client):
 bot = DeadAir()
 
 
-def allowed_only():
-    async def predicate(interaction: discord.Interaction) -> bool:
-        return interaction.user.id in CFG["AllowedUsers"]
-    return app_commands.check(predicate)
-
-
 @bot.tree.error
 async def on_app_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     original = getattr(error, "original", error)
-    if isinstance(error, app_commands.CheckFailure):
-        embed = error_embed("You're not on the allow list for this bot.", "Access denied")
-    elif isinstance(original, AuthError):
+    if isinstance(original, AuthError):
         embed = error_embed("The bot's Roblox cookie is dead. Replace `ROBLOX_COOKIE` and restart.", "Roblox login failed")
     elif isinstance(original, RobloxError):
         embed = error_embed(str(original), "Roblox rejected the request")
@@ -444,7 +435,6 @@ async def check_single(interaction: discord.Interaction, asset_id: int):
 # ================================================================
 
 @bot.tree.command(name="check", description="Check if a Roblox audio works, plus its info and loudness")
-@allowed_only()
 @app_commands.describe(
     ids="One audio ID for the full card, or several IDs for a quick list",
     group_id="Optional: a group to make sure the bot's account is in first",
@@ -496,7 +486,6 @@ async def check(interaction: discord.Interaction, ids: str, group_id: Optional[s
 
 
 @bot.tree.command(name="search", description="Search a group's audio library by name or keyword")
-@allowed_only()
 @app_commands.describe(
     group_id="The group ID (a group URL works too)",
     term="Keyword(s) or an exact audio name",
@@ -551,7 +540,6 @@ async def search(interaction: discord.Interaction, group_id: str, term: str, exa
 
 
 @bot.tree.command(name="join", description="Make the bot's Roblox account join a group")
-@allowed_only()
 @app_commands.describe(group_id="The group ID (a group URL works too)")
 async def join(interaction: discord.Interaction, group_id: str):
     await interaction.response.defer(thinking=True)
@@ -568,7 +556,6 @@ async def join(interaction: discord.Interaction, group_id: str):
 
 
 @bot.tree.command(name="whoami", description="Show which Roblox account the bot is running on")
-@allowed_only()
 async def whoami(interaction: discord.Interaction):
     u = bot.rbx.user
     e = make_embed("Bot account", f"[{u['name']}](https://www.roblox.com/users/{u['id']}/profile)")
@@ -584,6 +571,4 @@ async def whoami(interaction: discord.Interaction):
 if __name__ == "__main__":
     if not CFG["Token"] or not CFG["Cookie"]:
         raise SystemExit("Missing DISCORD_TOKEN or ROBLOX_COOKIE. Copy .env.example to .env and fill it in.")
-    if not CFG["AllowedUsers"]:
-        log.warning("ALLOWED_USER_IDS is empty, so EVERY command will be denied. Add your Discord user ID.")
     bot.run(CFG["Token"])

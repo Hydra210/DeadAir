@@ -16,5 +16,3 @@ services:
         sync: false          # enter these in the dashboard, never commit them
       - key: ROBLOX_COOKIE
         sync: false
-      - key: ALLOWED_USER_IDS
-        sync: false
