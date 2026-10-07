@@ -10,6 +10,8 @@ import io
 import logging
 import os
 import re
+import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -108,12 +110,37 @@ async def show(interaction: discord.Interaction, embed: discord.Embed, *,
 # BOT SETUP
 # ================================================================
 
+class DeadAirTree(app_commands.CommandTree):
+    """Commands are open to anyone, so cap how fast one person can burn the shared Roblox account."""
+    LIMIT, WINDOW = 8, 30.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._hits: dict[int, deque] = {}
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.type is not discord.InteractionType.application_command:
+            return True  # autocomplete etc. are not counted
+        now = time.monotonic()
+        q = self._hits.setdefault(interaction.user.id, deque())
+        while q and now - q[0] > self.WINDOW:
+            q.popleft()
+        if len(q) >= self.LIMIT:
+            wait = int(self.WINDOW - (now - q[0])) + 1
+            await interaction.response.send_message(
+                embed=error_embed(f"You're sending commands too fast. Try again in {wait}s.", "Slow down"),
+                ephemeral=True)
+            return False
+        q.append(now)
+        return True
+
+
 class DeadAir(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.default())
         # Every command can be installed to a user's account or a server, and run in
         # servers, bot DMs, and group DMs / DMs with other users.
-        self.tree = app_commands.CommandTree(
+        self.tree = DeadAirTree(
             self,
             allowed_installs=app_commands.AppInstallationType(guild=True, user=True),
             allowed_contexts=app_commands.AppCommandContext(
@@ -169,6 +196,8 @@ bot = DeadAir()
 @bot.tree.error
 async def on_app_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     original = getattr(error, "original", error)
+    if isinstance(error, app_commands.CheckFailure):
+        return  # the rate limiter already replied
     if isinstance(original, AuthError):
         embed = error_embed("The bot's Roblox cookie is dead. Replace `ROBLOX_COOKIE` and restart.", "Roblox login failed")
     elif isinstance(original, RobloxError):
@@ -477,10 +506,10 @@ async def check_single(interaction: discord.Interaction, asset_id: int):
 @bot.tree.command(name="check", description="Check if a Roblox audio works, plus its info and loudness")
 @app_commands.describe(
     ids="One audio ID for the full card, or several IDs for a quick list",
-    group_id="Optional: a group to make sure the bot's account is in first",
+    group="Optional: a group (name or ID) to make sure the bot's account is in first",
     only_moderated="For several IDs: only show the moderated ones",
 )
-async def check(interaction: discord.Interaction, ids: str, group_id: Optional[str] = None,
+async def check(interaction: discord.Interaction, ids: str, group: Optional[str] = None,
                 only_moderated: bool = False):
     await interaction.response.defer(thinking=True)
 
@@ -497,8 +526,9 @@ async def check(interaction: discord.Interaction, ids: str, group_id: Optional[s
         await show(interaction, error_embed(f"The limit is {CFG['MaxIds']} IDs at once, and you sent {len(clean)}.", "Too many IDs"))
         return
 
-    if group_id:
-        if not await ensure_group_access(interaction, parse_id(group_id, "group ID")):
+    if group:
+        gid = await pick_group(interaction, group, strict=True)
+        if not gid or not await ensure_group_access(interaction, gid):
             return
 
     if len(clean) == 1:
@@ -527,12 +557,12 @@ async def check(interaction: discord.Interaction, ids: str, group_id: Optional[s
 
 @bot.tree.command(name="search", description="Search a group's audio library by name or keyword")
 @app_commands.describe(
-    group_id="The group ID (a group URL works too)",
+    group="Group name or ID (a group URL works too)",
     term="Keyword(s) or an exact audio name",
     exact="Match the name exactly instead of by keywords",
     only_moderated="Only show the moderated ones",
 )
-async def search(interaction: discord.Interaction, group_id: str, term: str, exact: bool = False,
+async def search(interaction: discord.Interaction, group: str, term: str, exact: bool = False,
                  only_moderated: bool = False):
     await interaction.response.defer(thinking=True)
     term = term.strip()
@@ -540,7 +570,9 @@ async def search(interaction: discord.Interaction, group_id: str, term: str, exa
         await show(interaction, error_embed("Give me something to search for.", "Empty search"))
         return
 
-    gid = parse_id(group_id, "group ID")
+    gid = await pick_group(interaction, group, strict=True)
+    if not gid:
+        return
     info = await ensure_group_access(interaction, gid)
     if not info:
         return
@@ -598,10 +630,12 @@ async def search(interaction: discord.Interaction, group_id: str, term: str, exa
 
 
 @bot.tree.command(name="join", description="Make the bot's Roblox account join a group")
-@app_commands.describe(group_id="The group ID (a group URL works too)")
-async def join(interaction: discord.Interaction, group_id: str):
+@app_commands.describe(group="Group name or ID (a group URL works too)")
+async def join(interaction: discord.Interaction, group: str):
     await interaction.response.defer(thinking=True)
-    gid = parse_id(group_id, "group ID")
+    gid = await pick_group(interaction, group, strict=True)
+    if not gid:
+        return
     info, state = await try_access(interaction, gid)
     link = f"[{link_text(info.name)}]({group_url(gid)})"
 
@@ -802,11 +836,13 @@ def build_group_card(d: dict, roles: list, icon: Optional[str]) -> discord.Embed
     return e
 
 
-@bot.tree.command(name="group", description="Look up a Roblox group by ID or link")
-@app_commands.describe(group="Group ID or a roblox.com group link")
+@bot.tree.command(name="group", description="Look up a Roblox group by name, ID, or link")
+@app_commands.describe(group="Group name, ID, or a roblox.com group link")
 async def group_cmd(interaction: discord.Interaction, group: str):
     await interaction.response.defer(thinking=True)
-    gid = parse_id(group, "group ID")
+    gid = await pick_group(interaction, group, strict=False)
+    if not gid:
+        return
     d, roles, icon = await asyncio.gather(
         bot.rbx.group_details(gid), bot.rbx.group_roles(gid), bot.rbx.group_icon(gid))
     if not d:
@@ -899,15 +935,16 @@ def build_game_card(d: dict, votes: Optional[dict], icon: Optional[str]) -> disc
     return e
 
 
-@bot.tree.command(name="game", description="Look up a Roblox game by place ID, universe ID, or link")
-@app_commands.describe(game="Place ID, universe ID, or a roblox.com/games link")
+@bot.tree.command(name="game", description="Look up a Roblox game by name, place ID, or link")
+@app_commands.describe(game="Game name, place ID, or a roblox.com/games link")
 async def game_cmd(interaction: discord.Interaction, game: str):
     await interaction.response.defer(thinking=True)
-    n = parse_id(game, "game ID")
-    universe = await bot.rbx.universe_from_place(n) or n  # a place ID resolves to its universe; otherwise try it as one
+    universe = await pick_game(interaction, game)
+    if not universe:
+        return
     d = await bot.rbx.game_details(universe)
     if not d:
-        await show(interaction, not_found("Game", f"No game with the place or universe ID `{n}` was found."))
+        await show(interaction, not_found("Game", f"No game was found for `{link_text(game, 60)}`."))
         return
     votes, icon = await asyncio.gather(bot.rbx.game_votes(universe), bot.rbx.game_icon(universe))
     await show(interaction, build_game_card(d, votes, icon))
@@ -951,22 +988,652 @@ async def badge_cmd(interaction: discord.Interaction, badge_id: str):
     await show(interaction, build_badge_card(d, await bot.rbx.badge_icon(bid)))
 
 
+# ================================================================
+# NAME OR ID: groups and games
+# ================================================================
+
+SEARCH_TTL = 90.0
+_search_cache: dict = {}
+
+
+def looks_like_id(q: str) -> bool:
+    """A bare number or a roblox.com link counts as an ID. Anything else is treated as a name."""
+    q = (q or "").strip()
+    return bool(re.fullmatch(r"\d+", q) or re.search(r"roblox\.com|rbxcdn\.com", q, re.I))
+
+
+def id_from_text(q: str) -> Optional[int]:
+    m = (re.search(r"(?:communities|groups|games|users|badges|catalog|library|asset|store/asset)/(\d+)", q, re.I)
+         or re.search(r"\d+", q or ""))
+    return int(m.group(1) if m and m.groups() else m.group()) if m else None
+
+
+async def cached_search(kind: str, query: str) -> list[dict]:
+    key = (kind, query.strip().lower())
+    hit = _search_cache.get(key)
+    if hit and time.monotonic() - hit[0] < SEARCH_TTL:
+        return hit[1]
+    results = await (bot.rbx.search_groups(query) if kind == "group" else bot.rbx.search_games(query))
+    if len(_search_cache) > 300:
+        _search_cache.clear()
+    _search_cache[key] = (time.monotonic(), results)
+    return results
+
+
+async def pick_group(interaction: discord.Interaction, query: str, *, strict: bool) -> Optional[int]:
+    """Group ID from an ID, a link, or a name. strict=True never guesses (used before any join)."""
+    q = (query or "").strip()
+    if looks_like_id(q):
+        gid = id_from_text(q)
+        if not gid:
+            raise RobloxError("That doesn't look like a valid group ID.")
+        return gid
+
+    results = await cached_search("group", q)
+    exact = [g for g in results if (g.get("name") or "").strip().lower() == q.lower()]
+    if exact:
+        return int(max(exact, key=lambda g: g.get("memberCount") or 0)["id"])
+    if not results:
+        await show(interaction, not_found("Group", f"No group matched `{link_text(q, 60)}`. Try the group ID."))
+        return None
+    if strict:
+        lines = [f"[{esc(link_text(g.get('name'), 40))}]({group_url(g['id'])})  `{g['id']}`  "
+                 f"{num(g.get('memberCount'))} members" for g in results[:6]]
+        await show(interaction, make_embed(
+            "Which group?",
+            f"No group is named exactly `{link_text(q, 60)}`, and this action won't guess. "
+            "Pick one from the suggestions while typing, or run it again with the ID:\n\n" + "\n".join(lines)))
+        return None
+    return int(results[0]["id"])
+
+
+async def pick_game(interaction: discord.Interaction, query: str) -> Optional[int]:
+    """Universe ID from a name, place ID, link, or the 'universe:ID' value autocomplete produces."""
+    q = (query or "").strip()
+    m = re.fullmatch(r"universe:(\d+)", q, re.I)
+    if m:
+        return int(m.group(1))
+    if looks_like_id(q):
+        n = id_from_text(q)
+        if not n:
+            raise RobloxError("That doesn't look like a valid game ID.")
+        return await bot.rbx.universe_from_place(n) or n  # a place ID resolves to its universe
+
+    results = await cached_search("game", q)
+    exact = [g for g in results if (g.get("name") or "").strip().lower() == q.lower()]
+    chosen = exact[0] if exact else (results[0] if results else None)
+    if not chosen:
+        await show(interaction, not_found(
+            "Game", f"No game matched `{link_text(q, 60)}`. Try the place ID or the game's link."))
+        return None
+    return int(chosen["universeId"])
+
+
+async def _autocomplete(kind: str, current: str) -> list[app_commands.Choice]:
+    cur = (current or "").strip()
+    if len(cur) < 2 or bot.rbx is None:
+        return []
+    if looks_like_id(cur):
+        n = id_from_text(cur)
+        return [app_commands.Choice(name=f"Use ID {n}", value=str(n))] if n else []
+    try:
+        results = await asyncio.wait_for(cached_search(kind, cur), timeout=2.5)
+    except Exception:
+        return []
+    out = []
+    for r in results[:25]:
+        if kind == "group":
+            name, value = f"{clip(r.get('name'), 62)}  ({num(r.get('memberCount'))} members)", str(r.get("id"))
+        else:
+            playing = r.get("playerCount")
+            name = clip(r.get("name"), 70) + (f"  ({num(playing)} playing)" if playing is not None else "")
+            value = f"universe:{r.get('universeId')}"
+        if name.strip() and value not in ("None", "universe:None"):
+            out.append(app_commands.Choice(name=name[:100], value=value))
+    return out
+
+
+async def group_autocomplete(interaction: discord.Interaction, current: str):
+    return await _autocomplete("group", current)
+
+
+async def game_autocomplete(interaction: discord.Interaction, current: str):
+    return await _autocomplete("game", current)
+
+
+for _cmd, _param in ((check, "group"), (search, "group"), (join, "group"), (group_cmd, "group")):
+    _cmd.autocomplete(_param)(group_autocomplete)
+game_cmd.autocomplete("game")(game_autocomplete)
+
+
+# ================================================================
+# BIG LISTS: lazy-loading pager
+# ================================================================
+
+def esc(text: str) -> str:
+    """Escape Discord markdown so names like cool_user_1 don't turn italic."""
+    return re.sub(r"([_*~|>\\])", r"\\\1", text)
+
+
+class CursorPager(discord.ui.View):
+    """Shows rows a page at a time and fetches the next batch from Roblox only when you reach the end."""
+    MAX_ROWS = 5000
+
+    def __init__(self, owner_id: int, title: str, header: str, rows: list[str], cursor: Optional[str],
+                 fetch, color: int = COLORS["base"], thumbnail: Optional[str] = None):
+        super().__init__(timeout=300)
+        self.owner_id, self.title, self.header = owner_id, title, header
+        self.rows, self.cursor, self.fetch = rows, cursor, fetch
+        self.color, self.thumbnail = color, thumbnail
+        self.index = 0
+        self.lock = asyncio.Lock()
+        self.message: Optional[discord.Message] = None
+        self._sync()
+
+    def _has_next(self) -> bool:
+        return (self.index + 1) * CFG["PerPage"] < len(self.rows) or self.cursor is not None
+
+    def embed(self) -> discord.Embed:
+        per = CFG["PerPage"]
+        start = self.index * per
+        chunk = self.rows[start:start + per]
+        total = f"{len(self.rows)}+" if self.cursor is not None else str(len(self.rows))
+        body = (self.header + "\n\n" if self.header else "") + ("\n".join(chunk) or "Nothing here.")
+        e = discord.Embed(title=self.title, description=body, color=self.color)
+        e.set_footer(text=f"{start + 1} to {start + len(chunk)} of {total}  |  {CFG['Footer']}")
+        if self.thumbnail:
+            e.set_thumbnail(url=self.thumbnail)
+        return e
+
+    def _sync(self):
+        self.prev_btn.disabled = self.index == 0
+        self.next_btn.disabled = not self._has_next()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                embed=error_embed("These results belong to someone else.", "Not yours"), ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with self.lock:
+            self.index = max(0, self.index - 1)
+            self._sync()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        async with self.lock:
+            per = CFG["PerPage"]
+            tries = 0
+            while (self.index + 1) * per >= len(self.rows) and self.cursor is not None and tries < 3:
+                tries += 1
+                try:
+                    new_rows, self.cursor = await self.fetch(self.cursor)
+                except RobloxError:
+                    self.cursor = None
+                    break
+                self.rows.extend(new_rows)
+                if len(self.rows) >= self.MAX_ROWS:
+                    self.cursor = None
+            if (self.index + 1) * per < len(self.rows):
+                self.index += 1
+            self._sync()
+        await interaction.edit_original_response(embed=self.embed(), view=self)
+
+
+async def list_command(interaction: discord.Interaction, *, title: str, header: str, fetch, fmt,
+                       thumbnail: Optional[str] = None, empty: str = "Nothing to show."):
+    """fetch(cursor) -> (items, next_cursor). The first page loads now, the rest as you page."""
+    try:
+        items, cursor = await fetch("")
+    except RobloxError as e:
+        if isinstance(e, (AuthError, ChallengeRequired)):
+            raise
+        await show(interaction, error_embed(
+            f"Roblox wouldn't return this list. It may be private. ({e})", "List unavailable"))
+        return
+    rows = [fmt(i) for i in items]
+    if not rows:
+        e = make_embed(title, (header + "\n\n" if header else "") + empty)
+        if thumbnail:
+            e.set_thumbnail(url=thumbnail)
+        await show(interaction, e)
+        return
+
+    async def fetch_rows(cur: str):
+        its, nxt = await fetch(cur)
+        return [fmt(i) for i in its], nxt
+
+    pager = CursorPager(interaction.user.id, title, header, rows, cursor, fetch_rows, thumbnail=thumbnail)
+    pager.message = await show(interaction, pager.embed(), view=pager)
+
+
+# ---------- row formatters ----------
+
+def user_row(u: dict) -> str:
+    uid = u.get("id") or u.get("userId")
+    name, disp = u.get("name") or u.get("username"), u.get("displayName")
+    label = esc(link_text(disp or name, 32))
+    handle = f" (@{esc(link_text(name, 24))})" if disp and name and disp != name else ""
+    tail = "  Banned" if u.get("isBanned") else ""
+    return f"[{label}]({profile_url(uid)}){handle}  `{uid}`{tail}"
+
+
+def member_row(m: dict) -> str:
+    u = m.get("user") or {}
+    row = user_row({"id": u.get("userId"), "name": u.get("username"), "displayName": u.get("displayName")})
+    role = (m.get("role") or {}).get("name")
+    return row + (f"  {esc(link_text(role, 24))}" if role else "")
+
+
+def game_row(d: dict) -> str:
+    place = (d.get("rootPlace") or {}).get("id")
+    name = esc(link_text(d.get("name"), 44))
+    label = f"[{name}](https://www.roblox.com/games/{place})" if place else name
+    visits = d.get("placeVisits")
+    return f"{label}  `{place or d.get('id')}`" + (f"  {num(visits)} visits" if visits else "")
+
+
+def badge_row(d: dict) -> str:
+    awarded = (d.get("statistics") or {}).get("awardedCount")
+    return (f"[{esc(link_text(d.get('name'), 44))}](https://www.roblox.com/badges/{d.get('id')})  `{d.get('id')}`"
+            + (f"  {num(awarded)} awarded" if awarded is not None else ""))
+
+
+def pass_row(d: dict) -> str:
+    price = d.get("price")
+    cost = "Off sale" if price is None else ("Free" if price == 0 else f"R$ {num(price)}")
+    return (f"[{esc(link_text(d.get('name'), 44))}](https://www.roblox.com/game-pass/{d.get('id')})  "
+            f"`{d.get('id')}`  {cost}")
+
+
+def wear_row(d: dict) -> str:
+    econ = d["econ"]
+    type_name = ASSET_TYPES.get(econ.get("AssetTypeId"), "Item")
+    if econ.get("IsForSale"):
+        price = econ.get("PriceInRobux")
+        cost = "Free" if price == 0 else (f"R$ {num(price)}" if price is not None else "On sale")
+    else:
+        cost = "Not for sale"
+    return (f"[{esc(link_text(econ.get('Name'), 40))}](https://www.roblox.com/catalog/{d['id']})  "
+            f"`{d['id']}`  {type_name}  |  {cost}")
+
+
+def user_ref(u: dict) -> str:
+    return f"[{esc(link_text(u.get('name'), 30))}]({profile_url(u['id'])})"
+
+
+# ================================================================
+# USER LISTS: followers, following, friends, badges, games, wearing
+# ================================================================
+
+ORDER = [app_commands.Choice(name="Newest first", value="Desc"),
+         app_commands.Choice(name="Oldest first", value="Asc")]
+USER_ARG = "Username, user ID, or a roblox.com profile link"
+
+
+async def follow_list(interaction: discord.Interaction, user: str, kind: str, order: Optional[str]):
+    u = await find_user(interaction, user)
+    if not u:
+        return
+    uid, rbx, order = int(u["id"]), bot.rbx, order or "Desc"
+    count, head = await asyncio.gather(rbx.user_count(uid, kind), rbx.user_headshot(uid))
+    if kind == "followers":
+        title, line = "Followers", f"{user_ref(u)} has {num(count)} followers."
+    else:
+        title, line = "Following", f"{user_ref(u)} follows {num(count)} accounts."
+    header = f"{line} {'Newest' if order == 'Desc' else 'Oldest'} first."
+
+    async def fetch(cur: str):
+        return await rbx.follow_page(uid, kind, cur, order)
+
+    await list_command(interaction, title=title, header=header, fetch=fetch, fmt=user_row,
+                       thumbnail=head, empty="Nobody here.")
+
+
+@bot.tree.command(name="followers", description="List who follows a Roblox user")
+@app_commands.describe(user=USER_ARG, order="Which end of the list to start from")
+@app_commands.choices(order=ORDER)
+async def followers_cmd(interaction: discord.Interaction, user: str,
+                        order: Optional[app_commands.Choice[str]] = None):
+    await interaction.response.defer(thinking=True)
+    await follow_list(interaction, user, "followers", order.value if order else None)
+
+
+@bot.tree.command(name="following", description="List the accounts a Roblox user follows")
+@app_commands.describe(user=USER_ARG, order="Which end of the list to start from")
+@app_commands.choices(order=ORDER)
+async def following_cmd(interaction: discord.Interaction, user: str,
+                        order: Optional[app_commands.Choice[str]] = None):
+    await interaction.response.defer(thinking=True)
+    await follow_list(interaction, user, "followings", order.value if order else None)
+
+
+@bot.tree.command(name="friends", description="List a Roblox user's friends")
+@app_commands.describe(user=USER_ARG)
+async def friends_cmd(interaction: discord.Interaction, user: str):
+    await interaction.response.defer(thinking=True)
+    u = await find_user(interaction, user)
+    if not u:
+        return
+    uid, rbx = int(u["id"]), bot.rbx
+    count, head = await asyncio.gather(rbx.user_count(uid, "friends"), rbx.user_headshot(uid))
+
+    async def fetch(cur: str):
+        items = await rbx.friends_list(uid)
+        items.sort(key=lambda f: (f.get("displayName") or f.get("name") or "").lower())
+        return items, None
+
+    await list_command(interaction, title="Friends", header=f"{user_ref(u)} has {num(count)} friends.",
+                       fetch=fetch, fmt=user_row, thumbnail=head, empty="No friends to show.")
+
+
+@bot.tree.command(name="mutual", description="Mutual friends and groups between two Roblox users")
+@app_commands.describe(user="First user (name, ID, or link)", other="Second user (name, ID, or link)")
+async def mutual_cmd(interaction: discord.Interaction, user: str, other: str):
+    await interaction.response.defer(thinking=True)
+    u1 = await find_user(interaction, user)
+    if not u1:
+        return
+    u2 = await find_user(interaction, other)
+    if not u2:
+        return
+    id1, id2, rbx = int(u1["id"]), int(u2["id"]), bot.rbx
+    f1, f2, g1, g2 = await asyncio.gather(
+        rbx.friends_list(id1), rbx.friends_list(id2), rbx.user_groups(id1), rbx.user_groups(id2),
+        return_exceptions=True)
+    for r in (f1, f2, g1, g2):
+        if isinstance(r, (AuthError, ChallengeRequired)):
+            raise r
+    f1, f2 = (f1 if isinstance(f1, list) else None), (f2 if isinstance(f2, list) else None)
+    g1, g2 = (g1 if isinstance(g1, list) else []), (g2 if isinstance(g2, list) else [])
+
+    e = make_embed("Mutual connections", f"{user_ref(u1)} and {user_ref(u2)}")
+    if f1 is None or f2 is None:
+        e.add_field(name="Mutual friends", value="One of the friend lists couldn't be loaded.", inline=False)
+    else:
+        ids2 = {x["id"]: x for x in f2}
+        shared = [x for x in f1 if x["id"] in ids2]
+        shared.sort(key=lambda f: (f.get("displayName") or f.get("name") or "").lower())
+        text = "\n".join(user_row(x) for x in shared[:12]) or "None"
+        if len(shared) > 12:
+            text += f"\n...and {len(shared) - 12} more"
+        e.add_field(name=f"Mutual friends ({len(shared)})", value=clip_field(text), inline=False)
+        e.add_field(name="Friends with each other", value="Yes" if id2 in {x["id"] for x in f1} else "No", inline=True)
+
+    gids2 = {g["group"]["id"] for g in g2}
+    shared_groups = [g for g in g1 if g["group"]["id"] in gids2]
+    shared_groups.sort(key=lambda g: g["group"].get("memberCount") or 0, reverse=True)
+    text = "\n".join(f"[{esc(link_text(g['group'].get('name'), 40))}]({group_url(g['group']['id'])})  "
+                     f"`{g['group']['id']}`" for g in shared_groups[:10]) or "None"
+    if len(shared_groups) > 10:
+        text += f"\n...and {len(shared_groups) - 10} more"
+    e.add_field(name=f"Mutual groups ({len(shared_groups)})", value=clip_field(text), inline=False)
+    await show(interaction, e)
+
+
+def clip_field(text: str, limit: int = 1000) -> str:
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+@bot.tree.command(name="userbadges", description="List the badges a Roblox user has earned")
+@app_commands.describe(user=USER_ARG)
+async def userbadges_cmd(interaction: discord.Interaction, user: str):
+    await interaction.response.defer(thinking=True)
+    u = await find_user(interaction, user)
+    if not u:
+        return
+    uid, rbx = int(u["id"]), bot.rbx
+    head = await rbx.user_headshot(uid)
+
+    async def fetch(cur: str):
+        return await rbx.user_badges_page(uid, cur)
+
+    await list_command(interaction, title="Badges", header=f"Badges earned by {user_ref(u)}, newest first.",
+                       fetch=fetch, fmt=badge_row, thumbnail=head, empty="No badges to show.")
+
+
+@bot.tree.command(name="usergames", description="List the games a Roblox user has created")
+@app_commands.describe(user=USER_ARG)
+async def usergames_cmd(interaction: discord.Interaction, user: str):
+    await interaction.response.defer(thinking=True)
+    u = await find_user(interaction, user)
+    if not u:
+        return
+    uid, rbx = int(u["id"]), bot.rbx
+    head = await rbx.user_headshot(uid)
+
+    async def fetch(cur: str):
+        return await rbx.user_games_page(uid, cur)
+
+    await list_command(interaction, title="Created games", header=f"Games made by {user_ref(u)}. Codes are place IDs.",
+                       fetch=fetch, fmt=game_row, thumbnail=head, empty="No public games.")
+
+
+@bot.tree.command(name="favorites", description="List a Roblox user's favorite games")
+@app_commands.describe(user=USER_ARG)
+async def favorites_cmd(interaction: discord.Interaction, user: str):
+    await interaction.response.defer(thinking=True)
+    u = await find_user(interaction, user)
+    if not u:
+        return
+    uid, rbx = int(u["id"]), bot.rbx
+    head = await rbx.user_headshot(uid)
+
+    async def fetch(cur: str):
+        return await rbx.user_favorites_page(uid, cur)
+
+    await list_command(interaction, title="Favorite games", header=f"Favorites of {user_ref(u)}. Codes are place IDs.",
+                       fetch=fetch, fmt=game_row, thumbnail=head, empty="No favorites to show.")
+
+
+@bot.tree.command(name="wearing", description="List the items a Roblox user is wearing right now")
+@app_commands.describe(user=USER_ARG)
+async def wearing_cmd(interaction: discord.Interaction, user: str):
+    await interaction.response.defer(thinking=True)
+    u = await find_user(interaction, user)
+    if not u:
+        return
+    uid, rbx = int(u["id"]), bot.rbx
+    try:
+        ids = await rbx.currently_wearing(uid)
+    except RobloxError as e:
+        if isinstance(e, (AuthError, ChallengeRequired)):
+            raise
+        await show(interaction, error_embed(f"Roblox wouldn't return the outfit. ({e})", "Outfit unavailable"))
+        return
+    sem = asyncio.Semaphore(6)
+
+    async def one(aid: int):
+        async with sem:
+            return {"id": aid, "econ": await rbx.economy_details(aid) or {"Name": f"Asset {aid}"}}
+
+    items = list(await asyncio.gather(*(one(i) for i in ids[:40])))
+    head = await rbx.user_headshot(uid)
+
+    async def fetch(cur: str):
+        return items, None
+
+    await list_command(interaction, title="Currently wearing",
+                       header=f"{user_ref(u)} is wearing {len(ids)} items.", fetch=fetch, fmt=wear_row,
+                       thumbnail=head, empty="Not wearing anything.")
+
+
+@bot.tree.command(name="names", description="Show a Roblox user's past usernames")
+@app_commands.describe(user=USER_ARG)
+async def names_cmd(interaction: discord.Interaction, user: str):
+    await interaction.response.defer(thinking=True)
+    u = await find_user(interaction, user)
+    if not u:
+        return
+    uid = int(u["id"])
+    history, head = await asyncio.gather(bot.rbx.username_history(uid, 50), bot.rbx.user_headshot(uid))
+    e = make_embed("Past usernames", f"{user_ref(u)}, currently @{esc(link_text(u.get('name'), 30))}")
+    e.add_field(name=f"Previous ({len(history)})",
+                value=clip_field(", ".join(f"`{link_text(n, 24)}`" for n in history)) if history
+                else "No past usernames.", inline=False)
+    if head:
+        e.set_thumbnail(url=head)
+    await show(interaction, e)
+
+
+@bot.tree.command(name="membership", description="Check whether a Roblox user is in a group, and their role")
+@app_commands.describe(user=USER_ARG, group="Group name or ID")
+async def membership_cmd(interaction: discord.Interaction, user: str, group: str):
+    await interaction.response.defer(thinking=True)
+    u = await find_user(interaction, user)
+    if not u:
+        return
+    gid = await pick_group(interaction, group, strict=False)
+    if not gid:
+        return
+    rbx = bot.rbx
+    d, groups, head = await asyncio.gather(rbx.group_details(gid), rbx.user_groups(int(u["id"])), rbx.user_headshot(int(u["id"])))
+    if not d:
+        await show(interaction, not_found("Group", f"There's no group with the ID `{gid}`."))
+        return
+    link = f"[{esc(link_text(d.get('name'), 40))}]({group_url(gid)})"
+    match = next((g for g in groups if int(g["group"]["id"]) == gid), None)
+    if not match:
+        e = make_embed("Not in group", f"{user_ref(u)} isn't in {link} (`{gid}`).")
+    else:
+        role = match.get("role") or {}
+        e = make_embed("Group membership", f"{user_ref(u)} is in {link} (`{gid}`).")
+        e.add_field(name="Role", value=esc(link_text(role.get("name"), 40)), inline=True)
+        e.add_field(name="Rank", value=str(role.get("rank", "Unknown")), inline=True)
+        e.add_field(name="Members", value=num(d.get("memberCount")), inline=True)
+    if head:
+        e.set_thumbnail(url=head)
+    await show(interaction, e)
+
+
+# ================================================================
+# GROUP LISTS: members, games
+# ================================================================
+
+@bot.tree.command(name="members", description="List the members of a Roblox group")
+@app_commands.describe(group="Group name or ID", order="Which end of the list to start from")
+@app_commands.choices(order=ORDER)
+async def members_cmd(interaction: discord.Interaction, group: str,
+                      order: Optional[app_commands.Choice[str]] = None):
+    await interaction.response.defer(thinking=True)
+    gid = await pick_group(interaction, group, strict=False)
+    if not gid:
+        return
+    rbx, ordv = bot.rbx, (order.value if order else "Desc")
+    d, icon = await asyncio.gather(rbx.group_details(gid), rbx.group_icon(gid))
+    if not d:
+        await show(interaction, not_found("Group", f"There's no group with the ID `{gid}`."))
+        return
+    header = (f"[{esc(link_text(d.get('name'), 40))}]({group_url(gid)}) has {num(d.get('memberCount'))} members. "
+              f"{'Newest' if ordv == 'Desc' else 'Oldest'} first.")
+
+    async def fetch(cur: str):
+        return await rbx.group_members_page(gid, cur, ordv)
+
+    await list_command(interaction, title="Group members", header=header, fetch=fetch, fmt=member_row,
+                       thumbnail=icon, empty="No members to show.")
+
+
+@bot.tree.command(name="groupgames", description="List the games a Roblox group has made")
+@app_commands.describe(group="Group name or ID")
+async def groupgames_cmd(interaction: discord.Interaction, group: str):
+    await interaction.response.defer(thinking=True)
+    gid = await pick_group(interaction, group, strict=False)
+    if not gid:
+        return
+    rbx = bot.rbx
+    d, icon = await asyncio.gather(rbx.group_details(gid), rbx.group_icon(gid))
+    if not d:
+        await show(interaction, not_found("Group", f"There's no group with the ID `{gid}`."))
+        return
+
+    async def fetch(cur: str):
+        return await rbx.group_games_page(gid, cur)
+
+    await list_command(interaction, title="Group games",
+                       header=f"Games made by [{esc(link_text(d.get('name'), 40))}]({group_url(gid)}). Codes are place IDs.",
+                       fetch=fetch, fmt=game_row, thumbnail=icon, empty="No public games.")
+
+
+# ================================================================
+# GAME LISTS: game passes, badges
+# ================================================================
+
+async def game_list(interaction: discord.Interaction, game: str, *, title: str, noun: str, page_fn, fmt, empty: str):
+    universe = await pick_game(interaction, game)
+    if not universe:
+        return
+    rbx = bot.rbx
+    d, icon = await asyncio.gather(rbx.game_details(universe), rbx.game_icon(universe))
+    if not d:
+        await show(interaction, not_found("Game", f"No game was found for `{link_text(game, 60)}`."))
+        return
+    place = d.get("rootPlaceId")
+    name = f"[{esc(link_text(d.get('name'), 40))}](https://www.roblox.com/games/{place})"
+
+    async def fetch(cur: str):
+        return await getattr(rbx, page_fn)(universe, cur)
+
+    await list_command(interaction, title=title, header=f"{noun} in {name}.", fetch=fetch, fmt=fmt,
+                       thumbnail=icon, empty=empty)
+
+
+@bot.tree.command(name="gamepasses", description="List a Roblox game's game passes and prices")
+@app_commands.describe(game="Game name, place ID, or a roblox.com/games link")
+async def gamepasses_cmd(interaction: discord.Interaction, game: str):
+    await interaction.response.defer(thinking=True)
+    await game_list(interaction, game, title="Game passes", noun="Game passes", page_fn="game_passes_page",
+                    fmt=pass_row, empty="This game has no game passes.")
+
+
+@bot.tree.command(name="gamebadges", description="List a Roblox game's badges and how many were awarded")
+@app_commands.describe(game="Game name, place ID, or a roblox.com/games link")
+async def gamebadges_cmd(interaction: discord.Interaction, game: str):
+    await interaction.response.defer(thinking=True)
+    await game_list(interaction, game, title="Game badges", noun="Badges", page_fn="game_badges_page",
+                    fmt=badge_row, empty="This game has no badges.")
+
+
+for _cmd in (gamepasses_cmd, gamebadges_cmd):
+    _cmd.autocomplete("game")(game_autocomplete)
+for _cmd in (members_cmd, groupgames_cmd, membership_cmd):
+    _cmd.autocomplete("group")(group_autocomplete)
+
+
 # ---------- help ----------
 
 @bot.tree.command(name="help", description="List everything DeadAir can do")
 async def help_cmd(interaction: discord.Interaction):
-    e = make_embed("DeadAir", "Roblox lookups and audio checking. Everything works in servers and DMs.")
+    e = make_embed("DeadAir", "Roblox lookups and audio checking. Works in servers and DMs.\n"
+                              "Groups and games accept a name (pick from the suggestions), an ID, or a link.")
     e.add_field(name="Audio", value=(
         "`/check` working or moderated, plus info, loudness and a waveform\n"
         "`/search` search a group's audio library by name or keyword"), inline=False)
-    e.add_field(name="Lookups", value=(
-        "`/user` profile by username, ID or link\n"
-        "`/avatar` a user's current avatar\n"
-        "`/usergroups` the groups a user is in\n"
-        "`/group` group info by ID or link\n"
-        "`/asset` any asset type by ID\n"
-        "`/game` game info by place or universe ID\n"
-        "`/badge` badge info by ID"), inline=False)
+    e.add_field(name="Users", value=(
+        "`/user` profile card\n`/avatar` current avatar\n`/wearing` items they have on\n"
+        "`/followers` `/following` `/friends` full lists, paged\n"
+        "`/mutual` shared friends and groups between two users\n"
+        "`/usergroups` `/membership` groups and roles\n"
+        "`/userbadges` `/usergames` `/favorites` `/names`"), inline=False)
+    e.add_field(name="Groups", value=(
+        "`/group` group card\n`/members` member list\n`/groupgames` games the group made"), inline=False)
+    e.add_field(name="Games and items", value=(
+        "`/game` game card\n`/gamepasses` `/gamebadges` passes and badges for a game\n"
+        "`/asset` any asset by ID\n`/badge` badge by ID"), inline=False)
     e.add_field(name="Bot", value="`/join` make the bot's account join a group\n`/whoami` which account the bot uses",
                 inline=False)
     await interaction.response.send_message(embed=e, ephemeral=True)

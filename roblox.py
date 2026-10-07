@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse
@@ -371,10 +372,10 @@ class RobloxClient:
         d = await self._safe(self._request("GET", f"https://friends.roblox.com/v1/users/{user_id}/{kind}/count"))
         return d.get("count") if isinstance(d, dict) and "count" in d else None
 
-    async def username_history(self, user_id: int) -> list[str]:
+    async def username_history(self, user_id: int, limit: int = 10) -> list[str]:
         d = await self._safe(self._request(
             "GET", f"https://users.roblox.com/v1/users/{user_id}/username-history",
-            params={"limit": "10", "sortOrder": "Desc"}))
+            params={"limit": str(limit), "sortOrder": "Desc"}))
         return [x["name"] for x in (d or {}).get("data", []) if x.get("name")]
 
     async def user_groups(self, user_id: int) -> list[dict]:
@@ -443,6 +444,86 @@ class RobloxClient:
     async def badge_icon(self, badge_id: int) -> Optional[str]:
         return await self._thumb("https://thumbnails.roblox.com/v1/badges/icons", {
             "badgeIds": str(badge_id), "size": "150x150", "format": "Png", "isCircular": "false"})
+
+    # ---------- search by name ----------
+
+    async def search_groups(self, query: str, limit: int = 10) -> list[dict]:
+        """[{ id, name, memberCount, publicEntryAllowed, hasVerifiedBadge, ... }], exact matches first."""
+        d = await self._safe(self._request(
+            "GET", "https://groups.roblox.com/v1/groups/search",
+            params={"keyword": query, "prioritizeExactMatch": "true", "limit": str(limit)}))
+        return (d or {}).get("data", []) or []
+
+    async def search_games(self, query: str) -> list[dict]:
+        """[{ universeId, name, rootPlaceId, playerCount, creator }] from Roblox's omni-search."""
+        d = await self._safe(self._request(
+            "GET", "https://apis.roblox.com/search-api/omni-search",
+            params={"searchQuery": query, "pageType": "all", "sessionId": str(uuid.uuid4())}))
+        out, seen = [], set()
+        for grp in (d or {}).get("searchResults", []) or []:
+            if "game" not in str(grp.get("contentGroupType", "")).lower():
+                continue
+            for c in grp.get("contents", []) or []:
+                try:
+                    uid = int(c.get("contentId") or c.get("universeId"))
+                except (TypeError, ValueError):
+                    continue
+                if uid in seen:
+                    continue
+                seen.add(uid)
+                out.append({"universeId": uid, "name": c.get("name"), "rootPlaceId": c.get("rootPlaceId"),
+                            "playerCount": c.get("playerCount"), "creator": c.get("creatorName")})
+        return out
+
+    # ---------- paged lists (errors propagate so the bot can explain private lists) ----------
+
+    async def _page(self, url: str, *, cursor: str = "", params: Optional[dict] = None):
+        p = dict(params or {})
+        if cursor:
+            p["cursor"] = cursor
+        d = await self._request("GET", url, params=p)
+        return (d.get("data") or []), (d.get("nextPageCursor") or None)
+
+    async def friends_list(self, user_id: int) -> list[dict]:
+        d = await self._request("GET", f"https://friends.roblox.com/v1/users/{user_id}/friends")
+        return d.get("data") or []
+
+    async def follow_page(self, user_id: int, kind: str, cursor: str = "", order: str = "Desc"):
+        """kind: followers | followings"""
+        return await self._page(f"https://friends.roblox.com/v1/users/{user_id}/{kind}",
+                                cursor=cursor, params={"limit": "100", "sortOrder": order})
+
+    async def user_badges_page(self, user_id: int, cursor: str = ""):
+        return await self._page(f"https://badges.roblox.com/v1/users/{user_id}/badges",
+                                cursor=cursor, params={"limit": "100", "sortOrder": "Desc"})
+
+    async def user_games_page(self, user_id: int, cursor: str = ""):
+        return await self._page(f"https://games.roblox.com/v2/users/{user_id}/games",
+                                cursor=cursor, params={"limit": "50", "sortOrder": "Desc"})
+
+    async def user_favorites_page(self, user_id: int, cursor: str = ""):
+        return await self._page(f"https://games.roblox.com/v2/users/{user_id}/favorite/games",
+                                cursor=cursor, params={"limit": "50", "sortOrder": "Desc"})
+
+    async def group_members_page(self, group_id: int, cursor: str = "", order: str = "Desc"):
+        return await self._page(f"https://groups.roblox.com/v1/groups/{group_id}/users",
+                                cursor=cursor, params={"limit": "100", "sortOrder": order})
+
+    async def group_games_page(self, group_id: int, cursor: str = ""):
+        return await self._page(f"https://games.roblox.com/v2/groups/{group_id}/games",
+                                cursor=cursor, params={"limit": "50", "sortOrder": "Desc"})
+
+    async def game_passes_page(self, universe_id: int, cursor: str = ""):
+        return await self._page(f"https://games.roblox.com/v1/games/{universe_id}/game-passes",
+                                cursor=cursor, params={"limit": "100", "sortOrder": "Asc"})
+
+    async def game_badges_page(self, universe_id: int, cursor: str = ""):
+        return await self._page(f"https://badges.roblox.com/v1/universes/{universe_id}/badges",
+                                cursor=cursor, params={"limit": "100", "sortOrder": "Asc"})
+
+    async def currently_wearing(self, user_id: int) -> list[int]:
+        d = await self._request("GET", f"https://avatar.roblox.com/v1/users/{user_id}/currently-wearing")
+        return [int(i) for i in (d.get("assetIds") or [])]
 
     # ---------- audio file download ----------
 

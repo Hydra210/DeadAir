@@ -5,21 +5,55 @@ and what it sounds like (a black-and-white loudness waveform). No emojis, everyt
 
 ## Commands
 
+Groups and games accept a **name, an ID, or a link**. Start typing a name and pick from the suggestions.
+Anything that can make the bot's account join a group (`/join`, `/search`, `/check group`) never guesses: it
+needs an exact name or an ID, and shows suggestions otherwise.
+
+**Audio**
+
 | Command | What it does |
 |---|---|
 | `/check ids:<one ID>` | Full card: status, length, group (link + ID), dates, loudness stats, waveform image |
 | `/check ids:<several IDs>` | Quick list with name and working/moderated status per ID |
-| `/search group_id term [exact] [only_moderated]` | Search a group's audio by keyword(s) or exact name |
-| `/join group_id` | Make the bot's Roblox account join a group |
-| `/whoami` | Which Roblox account the bot runs on |
-| `/user user:<name, ID or link>` | Profile card: username, ID, join date, friends/followers/following, groups, past usernames |
-| `/avatar user` | A user's current avatar |
-| `/usergroups user` | Every group a user is in, with their role (paged) |
-| `/group group:<ID or link>` | Group card: owner, members, joining, shout, roles |
-| `/asset asset_id` | Any asset type: type, creator, dates, price, sales, limited, moderation when available |
-| `/game game:<place ID, universe ID or link>` | Playing now, visits, favorites, likes, creator, dates |
-| `/badge badge_id` | Awarded count, win rate, game, status |
-| `/help` | Lists every command |
+| `/search group term [exact] [only_moderated]` | Search a group's audio by keyword(s) or exact name |
+
+**Users** (username, ID, or profile link)
+
+| Command | What it does |
+|---|---|
+| `/user` | Profile card: join date, friends/followers/following, groups, past usernames |
+| `/avatar` | Current avatar |
+| `/wearing` | Every item they have on right now, with prices and catalog links |
+| `/followers [order]` | Everyone who follows them, newest or oldest first. Loads more as you page |
+| `/following [order]` | Everyone they follow |
+| `/friends` | Friend list |
+| `/mutual user other` | Mutual friends and mutual groups between two users |
+| `/usergroups` / `/membership user group` | All their groups, or their role in one group |
+| `/userbadges` / `/usergames` / `/favorites` / `/names` | Badges earned, games created, favorite games, past usernames |
+
+**Groups**
+
+| Command | What it does |
+|---|---|
+| `/group` | Group card: owner, members, joining, shout, roles |
+| `/members group [order]` | Member list with roles. Loads more as you page |
+| `/groupgames group` | Games the group has made |
+
+**Games and items**
+
+| Command | What it does |
+|---|---|
+| `/game` | Playing now, visits, favorites, likes, creator, dates |
+| `/gamepasses` / `/gamebadges` | A game's passes with prices, or its badges with award counts |
+| `/asset` / `/badge` | Any asset or badge by ID |
+
+**Bot:** `/join group`, `/whoami`, `/help`.
+
+Lists of people (`/followers`, `/following`, `/members`) can be huge, so the first batch loads right away and the
+bot fetches more from Roblox only when you page forward. A list that is private on Roblox shows a clear message
+instead of an error.
+
+Each person is limited to 8 commands per 30 seconds, since everyone shares one Roblox account and one rate limit.
 
 If the bot's account isn't in a group it needs, the message switches to "Joining group" and the bot joins
 by itself. For `/check` it only joins when it can't get the audio otherwise, so it doesn't pile up groups.
