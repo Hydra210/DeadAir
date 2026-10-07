@@ -88,6 +88,7 @@ class RobloxClient:
         self._last_join = 0.0
         self.user: Optional[dict] = None
         self.last_skipped = 0
+        self.last_meta = {"pages": 0, "raw": 0}
 
     async def start(self):
         self._session = aiohttp.ClientSession(
@@ -96,6 +97,15 @@ class RobloxClient:
                 "Origin": CFG["Origin"],
                 "Referer": CFG["Origin"] + "/",
                 "Cookie": f".ROBLOSECURITY={self._cookie}",
+                # What Chrome adds to a cross-site fetch from create.roblox.com (the extension's tab does this).
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-site",
             },
             timeout=aiohttp.ClientTimeout(total=30),
         )
@@ -242,6 +252,7 @@ class RobloxClient:
             if not cursor or pages >= CFG["MaxListPages"]:
                 break
         self.last_skipped = skipped  # entries with no asset ID yet (still processing)
+        self.last_meta = {"pages": pages, "raw": len(items) + skipped}
         return items  # [{ name, assetId }]
 
     async def asset_details(self, asset_ids: list[int]) -> dict[str, dict]:

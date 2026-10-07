@@ -15,7 +15,7 @@ needs an exact name or an ID, and shows suggestions otherwise.
 |---|---|
 | `/check ids:<one ID>` | Full card: status, length, group (link + ID), dates, loudness stats, waveform image |
 | `/check ids:<several IDs>` | Quick list with name and working/moderated status per ID |
-| `/search group term [exact] [only_moderated]` | Search a group's audio by keyword(s) or exact name |
+| `/search group term [exact] [only_moderated]` | Search a group's audio by part of a name, or exact name |
 
 **Users** (username, ID, or profile link)
 
@@ -69,6 +69,18 @@ by itself. For `/check` it only joins when it can't get the audio otherwise, so 
 
 Cookie: logged into the Roblox alt in a browser, DevTools (F12) -> Application -> Cookies -> roblox.com ->
 copy `.ROBLOSECURITY`. Don't log that account out afterwards, that kills the cookie.
+
+## Why `/search` can come back empty
+
+`/search` does exactly what the extension does: list the group's audio through Creator Dashboard's
+`creations` API, then match the name (exact: the name equals what you typed, otherwise: the name contains it,
+both ignoring case). The difference is *whose account asks*. The extension runs as your own account, which has
+a role with item permissions. The bot runs as its own account, and a plain Member role gets an empty list from
+Roblox, not an error. When that happens the bot now says so, with the account's role and rank.
+
+To fix it, give the bot's account a role that can manage group items in that group, or run the bot with the
+cookie of an account that already has one. Quick test: put your own account's cookie in `.env` locally and run
+the search again. If it finds the audio, it was the permissions.
 
 ## What auto-join can and can't do
 

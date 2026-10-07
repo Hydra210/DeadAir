@@ -555,11 +555,39 @@ async def check(interaction: discord.Interaction, ids: str, group: Optional[str]
                        "Run `/check` with a single ID for the full card.", rows, only_moderated)
 
 
+async def explain_no_match(gid: int, everything: list) -> str:
+    """Says WHY a search came back empty, using what Roblox actually returned to the bot."""
+    rbx = bot.rbx
+    try:
+        role = await rbx.group_role(gid)
+    except RobloxError:
+        role = None
+    meta = getattr(rbx, "last_meta", {})
+    out = ""
+    if role:
+        out += f"\nThe bot's account is in this group as **{link_text(role['name'], 40)}** (rank {role['rank']})."
+    if not everything:
+        out += (f"\n\n**Roblox answered the audio request with 0 entries** ({meta.get('pages', 0)} page, "
+                f"{meta.get('raw', 0)} raw). That is what it does when the account's role can't see the group's "
+                "creations: an empty list, not an error.\n"
+                "The extension finds audios because *your* account has a role with item permissions. "
+                "The bot only sees what its own account is allowed to see, so a plain Member role gets nothing.\n"
+                "**Fix:** give the bot's account a role that can manage group items, or run the bot with the "
+                "cookie of an account that already has one.")
+    else:
+        sample = ", ".join(f"`{link_text(it.get('name'), 30)}`" for it in everything[:5])
+        out += f"\nFirst names the bot saw: {sample}"
+    skipped = getattr(rbx, "last_skipped", 0)
+    if skipped:
+        out += f"\n{skipped} entries were skipped because Roblox hasn't given them an asset ID yet (still processing)."
+    return out
+
+
 @bot.tree.command(name="search", description="Search a group's audio library by name or keyword")
 @app_commands.describe(
     group="Group name or ID (a group URL works too)",
-    term="Keyword(s) or an exact audio name",
-    exact="Match the name exactly instead of by keywords",
+    term="Part of an audio name, or the exact name with exact on",
+    exact="Match the whole name exactly instead of a part of it",
     only_moderated="Only show the moderated ones",
 )
 async def search(interaction: discord.Interaction, group: str, term: str, exact: bool = False,
@@ -587,45 +615,33 @@ async def search(interaction: discord.Interaction, group: str, term: str, exact:
             return
         raise
 
+    # Same rule as the extension: exact -> name equals the term, otherwise -> name contains the term.
     low = term.lower()
-    words = low.split()
     matched = [it for it in everything
-               if (name := (it.get("name") or "").lower()) == low
-               or (not exact and all(w in name for w in words))]
+               if ((it.get("name") or "").lower() == low if exact else low in (it.get("name") or "").lower())]
 
     link = f"[{link_text(info.name)}]({group_url(gid)})"
     if not matched:
-        extra = ""
-        try:
-            role = await bot.rbx.group_role(gid)
-        except RobloxError:
-            role = None
-        if role:
-            extra += f"\nThe bot's account is in this group as **{link_text(role['name'], 40)}** (rank {role['rank']})."
-        if not everything:
-            extra += ("\nRoblox returned **0 audios** for this account. Either the group has no audio, or this role "
-                      "can't see the group's creations. Roblox sometimes returns an empty list instead of an error, "
-                      "so check the role's permissions in the group settings.")
-        if everything:
-            sample = ", ".join(f"`{link_text(it.get('name'), 30)}`" for it in everything[:5])
-            extra += f"\nFirst names the bot saw: {sample}"
-        skipped = getattr(bot.rbx, "last_skipped", 0)
-        if skipped:
-            extra += (f"\n{skipped} entries were skipped because Roblox hasn't given them an asset ID yet "
-                      "(usually still processing).")
         await show(interaction, make_embed(
             "No matches", f"Nothing matching `{link_text(term, 60)}` in {link} "
-                          f"({len(everything)} audios searched).{extra}"))
+                          f"({len(everything)} audios searched)." + await explain_no_match(gid, everything)))
         return
 
     ids = [int(m["assetId"]) for m in matched]
-    details = await bot.rbx.asset_details(ids)
+    status_note = ""
+    try:
+        details = await bot.rbx.asset_details(ids)
+    except (AuthError, ChallengeRequired):
+        raise
+    except RobloxError as e:
+        details = {}
+        status_note = f"\nThe matches were found, but Roblox wouldn't give their moderation status ({e})."
     rows = [{"id": int(m["assetId"]), "name": m.get("name"),
              "status": status_to_working(details.get(str(m["assetId"])))} for m in matched]
     icon = await bot.rbx.group_icon(gid)
 
     header = (f"{len(matched)} of {len(everything)} audios in {link} (`{gid}`) match "
-              f"`{link_text(term, 60)}`.")
+              f"`{link_text(term, 60)}`." + status_note)
     await send_results(interaction, "Audio search", header, rows, only_moderated, icon)
 
 
