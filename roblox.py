@@ -343,8 +343,10 @@ class RobloxClient:
     async def download_audio(self, asset_id: int) -> bytes:
         url = await self.audio_download_url(asset_id)
         parsed = urlparse(url)
-        if parsed.scheme != "https" or not (parsed.hostname or "").endswith(".rbxcdn.com"):
-            raise RobloxError("Asset delivery pointed somewhere that isn't Roblox's CDN.")
+        host = (parsed.hostname or "").lower()
+        allowed = ("rbxcdn.com", "roblox.com")
+        if parsed.scheme != "https" or not any(host == d or host.endswith("." + d) for d in allowed):
+            raise RobloxError(f"Asset delivery pointed to an unexpected host: {host or 'unknown'}")
 
         buf = bytearray()
         try:
