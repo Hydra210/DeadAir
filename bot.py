@@ -1,6 +1,9 @@
 # DeadAir — bot.py
 # Discord bot for checking Roblox group audio: availability, moderation, info and loudness.
 # Credits: @Nexesmere / EXE Development
+#
+# Commands are user-installable and work anywhere (servers, DMs, group DMs).
+# Requires discord.py >= 2.4
 
 import asyncio
 import io
@@ -32,7 +35,10 @@ CFG = {
     "Token": os.getenv("DISCORD_TOKEN", ""),
     "Cookie": os.getenv("ROBLOX_COOKIE", ""),
     "AutoJoin": os.getenv("AUTO_JOIN", "true").lower() in ("1", "true", "yes", "on"),
-    "DevGuildId": os.getenv("GUILD_ID", ""),   # optional: instant command sync in one server
+    # Optional. User-installable commands must be synced globally, so this is no longer used
+    # for syncing. If set, the bot clears any old guild-only copies of the commands from that
+    # server on startup so you don't see duplicates.
+    "DevGuildId": os.getenv("GUILD_ID", ""),
     "MaxIds": 500,
     "PerPage": 12,
     "Footer": "DeadAir  |  EXE Development",
@@ -105,7 +111,14 @@ async def show(interaction: discord.Interaction, embed: discord.Embed, *,
 class DeadAir(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.default())
-        self.tree = app_commands.CommandTree(self)
+        # Every command can be installed to a user's account or a server, and run in
+        # servers, bot DMs, and group DMs / DMs with other users.
+        self.tree = app_commands.CommandTree(
+            self,
+            allowed_installs=app_commands.AppInstallationType(guild=True, user=True),
+            allowed_contexts=app_commands.AppCommandContext(
+                guild=True, dm_channel=True, private_channel=True),
+        )
         self.rbx: Optional[RobloxClient] = None
         self.health: Optional[web.AppRunner] = None
 
@@ -132,12 +145,15 @@ class DeadAir(discord.Client):
         await self.rbx.start()  # raises if the cookie is dead
         log.info("Roblox account: %s (%s)", self.rbx.user["name"], self.rbx.user["id"])
 
+        # Clear any leftover guild-only commands from the old dev-guild sync (avoids duplicates).
         if CFG["DevGuildId"]:
             guild = discord.Object(id=int(CFG["DevGuildId"]))
-            self.tree.copy_global_to(guild=guild)
+            self.tree.clear_commands(guild=guild)
             await self.tree.sync(guild=guild)
-        else:
-            await self.tree.sync()
+
+        # Global sync: required for user-installable commands.
+        await self.tree.sync()
+        log.info("Commands synced globally")
 
     async def close(self):
         if self.rbx:
