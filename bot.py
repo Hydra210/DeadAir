@@ -564,6 +564,16 @@ async def search(interaction: discord.Interaction, group_id: str, term: str, exa
     link = f"[{link_text(info.name)}]({group_url(gid)})"
     if not matched:
         extra = ""
+        try:
+            role = await bot.rbx.group_role(gid)
+        except RobloxError:
+            role = None
+        if role:
+            extra += f"\nThe bot's account is in this group as **{link_text(role['name'], 40)}** (rank {role['rank']})."
+        if not everything:
+            extra += ("\nRoblox returned **0 audios** for this account. Either the group has no audio, or this role "
+                      "can't see the group's creations. Roblox sometimes returns an empty list instead of an error, "
+                      "so check the role's permissions in the group settings.")
         if everything:
             sample = ", ".join(f"`{link_text(it.get('name'), 30)}`" for it in everything[:5])
             extra += f"\nFirst names the bot saw: {sample}"

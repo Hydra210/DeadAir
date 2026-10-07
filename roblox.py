@@ -177,6 +177,17 @@ class RobloxClient:
         )
         return any(int(g["group"]["id"]) == int(group_id) for g in data.get("data", []))
 
+    async def group_role(self, group_id: int) -> Optional[dict]:
+        """The account's role in a group, e.g. {"name": "Member", "rank": 1}, or None if it isn't in it."""
+        data = await self._request(
+            "GET", f"https://groups.roblox.com/v1/users/{self.user['id']}/groups/roles"
+        )
+        for g in data.get("data", []):
+            if int(g["group"]["id"]) == int(group_id):
+                role = g.get("role") or {}
+                return {"name": role.get("name", "?"), "rank": role.get("rank")}
+        return None
+
     async def group_info(self, group_id: int) -> GroupInfo:
         d = await self._request("GET", f"https://groups.roblox.com/v1/groups/{group_id}")
         return GroupInfo(
