@@ -1,0 +1,20 @@
+# Render Blueprint for DeadAir. The bot has no web server, so it's a Background Worker.
+services:
+  - type: worker
+    name: deadair
+    runtime: python
+    plan: starter            # Background Workers have no free tier
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: AUTO_JOIN
+        value: "true"
+      - key: DISCORD_TOKEN
+        sync: false          # enter these in the dashboard, never commit them
+      - key: ROBLOX_COOKIE
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false

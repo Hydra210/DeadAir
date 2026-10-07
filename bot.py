@@ -1,0 +1,589 @@
+# DeadAir — bot.py
+# Discord bot for checking Roblox group audio: availability, moderation, info and loudness.
+# Credits: @Nexesmere / EXE Development
+
+import asyncio
+import io
+import logging
+import os
+import re
+from datetime import datetime, timezone
+from typing import Optional
+
+import discord
+from discord import app_commands
+from dotenv import load_dotenv
+
+import audio
+from roblox import (AuthError, ChallengeRequired, GroupInfo, RobloxClient,
+                    RobloxError, status_to_working)
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("deadair")
+
+
+# ================================================================
+# CONFIG
+# ================================================================
+
+CFG = {
+    "Token": os.getenv("DISCORD_TOKEN", ""),
+    "Cookie": os.getenv("ROBLOX_COOKIE", ""),
+    "AllowedUsers": {int(x) for x in re.findall(r"\d+", os.getenv("ALLOWED_USER_IDS", ""))},
+    "AutoJoin": os.getenv("AUTO_JOIN", "true").lower() in ("1", "true", "yes", "on"),
+    "DevGuildId": os.getenv("GUILD_ID", ""),   # optional: instant command sync in one server
+    "MaxIds": 500,
+    "PerPage": 12,
+    "Footer": "DeadAir  |  EXE Development",
+}
+
+COLORS = {"base": 0xF2F2F2, "bad": 0xE5484D}
+LABELS = {"working": "Working", "broken": "Moderated", "unknown": "Unknown"}
+AUDIO_TYPE_ID = 3
+
+
+# ================================================================
+# SMALL HELPERS
+# ================================================================
+
+def group_url(gid: int) -> str:
+    return f"https://www.roblox.com/communities/{gid}"
+
+
+def asset_url(aid) -> str:
+    return f"https://create.roblox.com/store/asset/{aid}"
+
+
+def link_text(text: Optional[str], limit: int = 48) -> str:
+    t = (text or "(unknown name)").replace("[", "(").replace("]", ")").replace("`", "'")
+    t = " ".join(t.split())
+    return t if len(t) <= limit else t[: limit - 3] + "..."
+
+
+def fmt_duration(seconds: float) -> str:
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def parse_ts(value: Optional[str]) -> Optional[int]:
+    if not value:
+        return None
+    try:
+        clean = re.sub(r"\.\d+", "", value).replace("Z", "+00:00")
+        return int(datetime.fromisoformat(clean).astimezone(timezone.utc).timestamp())
+    except ValueError:
+        return None
+
+
+def make_embed(title: Optional[str] = None, description: Optional[str] = None,
+               color: int = COLORS["base"]) -> discord.Embed:
+    e = discord.Embed(title=title, description=description, color=color)
+    e.set_footer(text=CFG["Footer"])
+    return e
+
+
+def error_embed(message: str, title: str = "Request failed") -> discord.Embed:
+    return make_embed(title, message, COLORS["bad"])
+
+
+async def show(interaction: discord.Interaction, embed: discord.Embed, *,
+               view: Optional[discord.ui.View] = None, file: Optional[discord.File] = None):
+    """Edits the single deferred response, so one message morphs: working -> joining -> result."""
+    kwargs = {"embed": embed, "attachments": [file] if file else []}
+    if view is not None:
+        kwargs["view"] = view
+    return await interaction.edit_original_response(**kwargs)
+
+
+# ================================================================
+# BOT SETUP
+# ================================================================
+
+class DeadAir(discord.Client):
+    def __init__(self):
+        super().__init__(intents=discord.Intents.default())
+        self.tree = app_commands.CommandTree(self)
+        self.rbx: Optional[RobloxClient] = None
+
+    async def setup_hook(self):
+        self.rbx = RobloxClient(CFG["Cookie"])
+        await self.rbx.start()  # raises if the cookie is dead
+        log.info("Roblox account: %s (%s)", self.rbx.user["name"], self.rbx.user["id"])
+
+        if CFG["DevGuildId"]:
+            guild = discord.Object(id=int(CFG["DevGuildId"]))
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+        else:
+            await self.tree.sync()
+
+    async def close(self):
+        if self.rbx:
+            await self.rbx.close()
+        await super().close()
+
+
+bot = DeadAir()
+
+
+def allowed_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        return interaction.user.id in CFG["AllowedUsers"]
+    return app_commands.check(predicate)
+
+
+@bot.tree.error
+async def on_app_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    original = getattr(error, "original", error)
+    if isinstance(error, app_commands.CheckFailure):
+        embed = error_embed("You're not on the allow list for this bot.", "Access denied")
+    elif isinstance(original, AuthError):
+        embed = error_embed("The bot's Roblox cookie is dead. Replace `ROBLOX_COOKIE` and restart.", "Roblox login failed")
+    elif isinstance(original, RobloxError):
+        embed = error_embed(str(original), "Roblox rejected the request")
+    else:
+        log.exception("Unhandled command error", exc_info=error)
+        embed = error_embed(f"`{original}`", "Unexpected error")
+
+    if interaction.response.is_done():
+        try:
+            await interaction.edit_original_response(embed=embed, attachments=[], view=None)
+        except discord.HTTPException:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ================================================================
+# GROUP ACCESS (auto-join)
+# ================================================================
+
+def parse_id(raw: str, what: str = "ID") -> int:
+    m = re.search(r"\d+", raw or "")
+    if not m:
+        raise RobloxError(f"That doesn't look like a valid {what}.")
+    return int(m.group())
+
+
+def access_problem(info: GroupInfo, state: str) -> Optional[str]:
+    link = f"[{link_text(info.name)}]({group_url(info.id)})"
+    return {
+        "disabled": f"The account isn't in {link} and auto-join is turned off.",
+        "locked": f"{link} is locked, so the account can't join it.",
+        "challenge": (f"Roblox asked for a captcha when joining {link}, and a bot can't solve that. "
+                      "Join the group once by hand on the bot's account, then run this again."),
+        "pending": (f"{link} needs approval. A join request was sent. "
+                    "Have someone accept it, then run this again."),
+    }.get(state)
+
+
+async def try_access(interaction: discord.Interaction, gid: int) -> tuple[GroupInfo, str]:
+    """state: member | joined | pending | disabled | locked | challenge. Announces the join in the message."""
+    rbx = bot.rbx
+    info = await rbx.group_info(gid)
+    if await rbx.in_group(gid):
+        return info, "member"
+    if not CFG["AutoJoin"]:
+        return info, "disabled"
+    if info.locked:
+        return info, "locked"
+
+    await show(interaction, make_embed(
+        "Joining group",
+        f"The account isn't in [{link_text(info.name)}]({group_url(gid)}) (`{gid}`), "
+        "so it's joining automatically.\nJoins are throttled, so this can take a moment.",
+    ))
+    try:
+        outcome = await rbx.join_group(gid)
+    except ChallengeRequired:
+        return info, "challenge"
+    return info, ("joined" if outcome in ("joined", "already") else "pending")
+
+
+async def ensure_group_access(interaction: discord.Interaction, gid: int) -> Optional[GroupInfo]:
+    """Returns GroupInfo if the account can use the group, otherwise shows why and returns None."""
+    info, state = await try_access(interaction, gid)
+    if state in ("member", "joined"):
+        return info
+    await show(interaction, error_embed(access_problem(info, state), "No access to group"))
+    return None
+
+
+# ================================================================
+# PAGINATED RESULTS
+# ================================================================
+
+class Pager(discord.ui.View):
+    def __init__(self, owner_id: int, title: str, header: str, lines: list[str],
+                 footer: str, color: int, thumbnail: Optional[str] = None):
+        super().__init__(timeout=300)
+        per = CFG["PerPage"]
+        self.pages = [lines[i:i + per] for i in range(0, len(lines), per)] or [[]]
+        self.owner_id, self.title, self.header = owner_id, title, header
+        self.footer, self.color, self.thumbnail = footer, color, thumbnail
+        self.index = 0
+        self.message: Optional[discord.Message] = None
+        self._sync()
+
+    def embed(self) -> discord.Embed:
+        body = (self.header + "\n\n" if self.header else "") + "\n".join(self.pages[self.index])
+        e = discord.Embed(title=self.title, description=body, color=self.color)
+        e.set_footer(text=f"Page {self.index + 1} of {len(self.pages)}  |  {self.footer}  |  DeadAir")
+        if self.thumbnail:
+            e.set_thumbnail(url=self.thumbnail)
+        return e
+
+    def _sync(self):
+        self.prev_btn.disabled = self.index == 0
+        self.next_btn.disabled = self.index >= len(self.pages) - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                embed=error_embed("These results belong to someone else.", "Not yours"), ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index = max(0, self.index - 1)
+        self._sync()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index = min(len(self.pages) - 1, self.index + 1)
+        self._sync()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+
+def fmt_row(row: dict) -> str:
+    return (f"**{LABELS[row['status']]}**  [{link_text(row['name'])}]({asset_url(row['id'])})  "
+            f"`{row['id']}`")
+
+
+async def send_results(interaction: discord.Interaction, title: str, header: str, rows: list[dict],
+                       only_moderated: bool, thumbnail: Optional[str] = None):
+    counts = {k: sum(1 for r in rows if r["status"] == k) for k in LABELS}
+    summary = f"{counts['working']} working, {counts['broken']} moderated, {counts['unknown']} unknown"
+    shown = [r for r in rows if r["status"] == "broken"] if only_moderated else rows
+
+    if not shown:
+        await show(interaction, make_embed(
+            title, (header + "\n\n" if header else "") +
+            ("Nothing moderated in these results." if only_moderated else "No results.")))
+        return
+
+    color = COLORS["bad"] if counts["broken"] else COLORS["base"]
+    pager = Pager(interaction.user.id, title, header + "\n" + summary if header else summary,
+                  [fmt_row(r) for r in shown], f"{len(shown)} shown", color, thumbnail)
+    pager.message = await show(interaction, pager.embed(), view=pager)
+
+
+# ================================================================
+# SINGLE AUDIO CARD
+# ================================================================
+
+def build_card(asset_id: int, econ: dict, status: str, stats: Optional[dict], toolbox: dict,
+               group: Optional[GroupInfo], icon: Optional[str], note: Optional[str],
+               has_wave: bool) -> discord.Embed:
+    name = econ.get("Name") or f"Audio {asset_id}"
+    desc = " ".join((econ.get("Description") or "").split())
+    if len(desc) > 220:
+        desc = desc[:217] + "..."
+
+    color = COLORS["bad"] if status == "broken" else COLORS["base"]
+    e = discord.Embed(title=link_text(name, 200), url=asset_url(asset_id),
+                      description=desc or None, color=color)
+
+    duration = stats["duration"] if stats else None
+    if duration is None and toolbox.get("duration"):
+        try:
+            duration = float(toolbox["duration"])
+        except (TypeError, ValueError):
+            duration = None
+
+    e.add_field(name="Status", value=LABELS[status], inline=True)
+    e.add_field(name="Length", value=fmt_duration(duration) if duration is not None else "Unknown", inline=True)
+    e.add_field(name="Asset ID", value=f"`{asset_id}`", inline=True)
+
+    creator = econ.get("Creator") or {}
+    if group:
+        e.add_field(name="Group", value=f"[{link_text(group.name, 40)}]({group_url(group.id)})", inline=True)
+        e.add_field(name="Group ID", value=f"`{group.id}`", inline=True)
+        e.add_field(name="Members", value=f"{group.member_count:,}" if group.member_count else "Unknown", inline=True)
+    elif creator:
+        uid = creator.get("Id") or creator.get("CreatorTargetId")
+        who = link_text(creator.get("Name"), 40)
+        e.add_field(name="Creator", value=f"[{who}](https://www.roblox.com/users/{uid}/profile)" if uid else who, inline=True)
+        e.add_field(name="Creator type", value=str(creator.get("CreatorType") or "User"), inline=True)
+        e.add_field(name="Creator ID", value=f"`{uid}`" if uid else "Unknown", inline=True)
+
+    created, updated = parse_ts(econ.get("Created")), parse_ts(econ.get("Updated"))
+    e.add_field(name="Created", value=f"<t:{created}:D>" if created else "Unknown", inline=True)
+    e.add_field(name="Updated", value=f"<t:{updated}:R>" if updated else "Unknown", inline=True)
+    e.add_field(name="Free to use", value="Yes" if econ.get("IsPublicDomain") else "No", inline=True)
+
+    extras = [(k.title(), str(toolbox[k])) for k in ("artist", "album", "genre") if toolbox.get(k)]
+    for label, value in extras[:3]:
+        e.add_field(name=label, value=link_text(value, 40), inline=True)
+
+    if stats:
+        e.add_field(
+            name="Loudness",
+            value=(f"Peak `{stats['peak_db']:.1f} dBFS`   Average `{stats['rms_db']:.1f} dBFS`   "
+                   f"Range `{stats['range_db']:.1f} dB`"),
+            inline=False,
+        )
+        channels = {1: "Mono", 2: "Stereo"}.get(stats["channels"], f"{stats['channels']} channels")
+        e.add_field(
+            name="File",
+            value=(f"{stats['format']}  |  {stats['sample_rate'] / 1000:g} kHz  |  {channels}  |  "
+                   f"{stats['size_bytes'] / 1_000_000:.2f} MB  |  about {stats['bitrate_kbps']:.0f} kbps"),
+            inline=False,
+        )
+
+    if note:
+        e.add_field(name="Note", value=note, inline=False)
+    if has_wave:
+        e.set_image(url="attachment://waveform.png")
+    if icon:
+        e.set_thumbnail(url=icon)
+    e.set_footer(text=CFG["Footer"])
+    return e
+
+
+async def probe_asset(asset_id: int):
+    """Moderation info + the audio file. Either can be missing if the account lacks access."""
+    rbx = bot.rbx
+    details = await rbx.asset_details([asset_id])
+    dev = details.get(str(asset_id))
+    data, err = None, None
+    if not (dev and dev.get("isModerated")):
+        try:
+            data = await rbx.download_audio(asset_id)
+        except (AuthError, ChallengeRequired):
+            raise
+        except RobloxError as e:
+            err = str(e)
+    return dev, data, err
+
+
+async def check_single(interaction: discord.Interaction, asset_id: int):
+    rbx = bot.rbx
+    econ = await rbx.economy_details(asset_id)
+    if not econ:
+        await show(interaction, error_embed(f"No asset with the ID `{asset_id}` was found.", "Asset not found"))
+        return
+    if econ.get("AssetTypeId") != AUDIO_TYPE_ID:
+        await show(interaction, error_embed(
+            f"`{asset_id}` is [{link_text(econ.get('Name'))}]({asset_url(asset_id)}), and it isn't an audio asset.",
+            "Not an audio asset"))
+        return
+
+    creator = econ.get("Creator") or {}
+    gid = None
+    if creator.get("CreatorType") == "Group":
+        gid = int(creator.get("CreatorTargetId") or creator.get("Id") or 0) or None
+
+    dev, data, dl_err = await probe_asset(asset_id)
+    note = None
+    group: Optional[GroupInfo] = None
+
+    moderated = bool(dev and dev.get("isModerated"))
+    if gid:
+        needs_access = (dev is None or data is None) and not moderated
+        if needs_access:
+            group, state = await try_access(interaction, gid)
+            if state in ("member", "joined"):
+                if state == "joined":
+                    note = f"The account joined [{link_text(group.name)}]({group_url(gid)}) automatically for this check."
+                dev, data, dl_err = await probe_asset(asset_id)
+            else:
+                note = access_problem(group, state)
+        else:
+            group = await rbx.group_info(gid)
+
+    status = status_to_working(dev) if dev else ("working" if data else "unknown")
+
+    stats, wave = None, None
+    if data:
+        try:
+            stats = await asyncio.to_thread(audio.analyze, data)
+            png = await asyncio.to_thread(audio.render_waveform, stats)
+            wave = discord.File(io.BytesIO(png), filename="waveform.png")
+        except Exception:
+            log.exception("Audio analysis failed for %s", asset_id)
+            note = (note + "\n" if note else "") + "The file downloaded, but it couldn't be decoded for a waveform."
+    elif status != "broken":
+        why = "Roblox wouldn't serve the file to this account. It may be moderated, deleted, or private."
+        note = (note + "\n" if note else "") + why
+    if status == "broken":
+        note = (note + "\n" if note else "") + "Roblox flagged this audio as moderated."
+
+    toolbox = await rbx.toolbox_audio_info(asset_id)
+    icon = await rbx.group_icon(gid) if gid else None
+    embed = build_card(asset_id, econ, status, stats, toolbox, group, icon, note, wave is not None)
+    await show(interaction, embed, file=wave)
+
+
+# ================================================================
+# COMMANDS
+# ================================================================
+
+@bot.tree.command(name="check", description="Check if a Roblox audio works, plus its info and loudness")
+@allowed_only()
+@app_commands.describe(
+    ids="One audio ID for the full card, or several IDs for a quick list",
+    group_id="Optional: a group to make sure the bot's account is in first",
+    only_moderated="For several IDs: only show the moderated ones",
+)
+async def check(interaction: discord.Interaction, ids: str, group_id: Optional[str] = None,
+                only_moderated: bool = False):
+    await interaction.response.defer(thinking=True)
+
+    seen, clean = set(), []
+    for raw in re.findall(r"\d+", ids):
+        n = int(raw)
+        if n > 0 and n not in seen:
+            seen.add(n)
+            clean.append(n)
+    if not clean:
+        await show(interaction, error_embed("No audio IDs found in that.", "Nothing to check"))
+        return
+    if len(clean) > CFG["MaxIds"]:
+        await show(interaction, error_embed(f"The limit is {CFG['MaxIds']} IDs at once, and you sent {len(clean)}.", "Too many IDs"))
+        return
+
+    if group_id:
+        if not await ensure_group_access(interaction, parse_id(group_id, "group ID")):
+            return
+
+    if len(clean) == 1:
+        await check_single(interaction, clean[0])
+        return
+
+    details = await bot.rbx.asset_details(clean)
+    sem = asyncio.Semaphore(5)
+
+    async def name_for(aid: int):
+        async with sem:
+            return await bot.rbx.asset_name_fallback(aid)
+
+    missing = [i for i in clean if str(i) not in details][:50]
+    fallback = dict(zip(missing, await asyncio.gather(*(name_for(i) for i in missing))))
+
+    rows = []
+    for aid in clean:
+        d = details.get(str(aid))
+        rows.append({"id": aid, "name": d.get("name") if d else fallback.get(aid),
+                     "status": status_to_working(d) if d else "unknown"})
+
+    await send_results(interaction, "Audio check", f"{len(clean)} audio IDs checked. "
+                       "Run `/check` with a single ID for the full card.", rows, only_moderated)
+
+
+@bot.tree.command(name="search", description="Search a group's audio library by name or keyword")
+@allowed_only()
+@app_commands.describe(
+    group_id="The group ID (a group URL works too)",
+    term="Keyword(s) or an exact audio name",
+    exact="Match the name exactly instead of by keywords",
+    only_moderated="Only show the moderated ones",
+)
+async def search(interaction: discord.Interaction, group_id: str, term: str, exact: bool = False,
+                 only_moderated: bool = False):
+    await interaction.response.defer(thinking=True)
+    term = term.strip()
+    if not term:
+        await show(interaction, error_embed("Give me something to search for.", "Empty search"))
+        return
+
+    gid = parse_id(group_id, "group ID")
+    info = await ensure_group_access(interaction, gid)
+    if not info:
+        return
+
+    try:
+        everything = await bot.rbx.list_group_audio(gid)
+    except RobloxError as e:
+        if str(e).startswith("403"):
+            await show(interaction, error_embed(
+                f"The account is in [{link_text(info.name)}]({group_url(gid)}), but its role can't view the "
+                "group's audio. It needs a role with asset or creations permissions.", "Missing permissions"))
+            return
+        raise
+
+    low = term.lower()
+    words = low.split()
+    matched = [it for it in everything
+               if (name := (it.get("name") or "").lower()) == low
+               or (not exact and all(w in name for w in words))]
+
+    link = f"[{link_text(info.name)}]({group_url(gid)})"
+    if not matched:
+        await show(interaction, make_embed(
+            "No matches", f"Nothing matching `{link_text(term, 60)}` in {link} "
+                          f"({len(everything)} audios searched)."))
+        return
+
+    ids = [int(m["assetId"]) for m in matched]
+    details = await bot.rbx.asset_details(ids)
+    rows = [{"id": int(m["assetId"]), "name": m.get("name"),
+             "status": status_to_working(details.get(str(m["assetId"])))} for m in matched]
+    icon = await bot.rbx.group_icon(gid)
+
+    header = (f"{len(matched)} of {len(everything)} audios in {link} (`{gid}`) match "
+              f"`{link_text(term, 60)}`.")
+    await send_results(interaction, "Audio search", header, rows, only_moderated, icon)
+
+
+@bot.tree.command(name="join", description="Make the bot's Roblox account join a group")
+@allowed_only()
+@app_commands.describe(group_id="The group ID (a group URL works too)")
+async def join(interaction: discord.Interaction, group_id: str):
+    await interaction.response.defer(thinking=True)
+    gid = parse_id(group_id, "group ID")
+    info, state = await try_access(interaction, gid)
+    link = f"[{link_text(info.name)}]({group_url(gid)})"
+
+    if state == "member":
+        await show(interaction, make_embed("Already in group", f"The account is already in {link} (`{gid}`)."))
+    elif state == "joined":
+        await show(interaction, make_embed("Joined group", f"The account is now in {link} (`{gid}`)."))
+    else:
+        await show(interaction, error_embed(access_problem(info, state), "Couldn't join"))
+
+
+@bot.tree.command(name="whoami", description="Show which Roblox account the bot is running on")
+@allowed_only()
+async def whoami(interaction: discord.Interaction):
+    u = bot.rbx.user
+    e = make_embed("Bot account", f"[{u['name']}](https://www.roblox.com/users/{u['id']}/profile)")
+    e.add_field(name="User ID", value=f"`{u['id']}`", inline=True)
+    e.add_field(name="Auto-join", value="On" if CFG["AutoJoin"] else "Off", inline=True)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+# ================================================================
+# RUN
+# ================================================================
+
+if __name__ == "__main__":
+    if not CFG["Token"] or not CFG["Cookie"]:
+        raise SystemExit("Missing DISCORD_TOKEN or ROBLOX_COOKIE. Copy .env.example to .env and fill it in.")
+    if not CFG["AllowedUsers"]:
+        log.warning("ALLOWED_USER_IDS is empty, so EVERY command will be denied. Add your Discord user ID.")
+    bot.run(CFG["Token"])

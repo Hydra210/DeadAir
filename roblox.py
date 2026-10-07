@@ -1,0 +1,363 @@
+# DeadAir — roblox.py
+# Server-side port of the EXE Audio Checker's Roblox logic.
+# Credits: @Nexesmere / EXE Development
+
+import asyncio
+import time
+from dataclasses import dataclass
+from typing import Optional
+from urllib.parse import urlparse
+
+import aiohttp
+
+# ================================================================
+# CONFIG
+# ================================================================
+
+CFG = {
+    "UserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Origin": "https://create.roblox.com",
+    "StatusChunkSize": 20,      # develop.roblox.com/v1/assets batch size (same as the extension)
+    "ListPageLimit": 100,
+    "MaxListPages": 25,         # ~2500 assets, same cap as the extension
+    "MaxRetries": 4,
+    "MaxAudioBytes": 30_000_000,  # refuse to download anything bigger than this
+    "JoinCooldownSeconds": 30,  # min gap between group joins so the account doesn't get flagged
+}
+
+
+# ================================================================
+# ERRORS / TYPES
+# ================================================================
+
+class RobloxError(Exception):
+    pass
+
+
+class AuthError(RobloxError):
+    """The .ROBLOSECURITY cookie is dead."""
+
+
+class ChallengeRequired(RobloxError):
+    """Roblox demanded a captcha / challenge. Can't be solved from a bot."""
+
+
+@dataclass
+class GroupInfo:
+    id: int
+    name: str
+    public_entry: bool
+    locked: bool
+    member_count: int = 0
+
+
+def status_to_working(item: Optional[dict]) -> str:
+    # Same logic as the extension: isModerated is the real signal.
+    if not item:
+        return "unknown"
+    review = item.get("reviewStatus")
+    if review and review != "Finished":
+        return "unknown"
+    return "broken" if item.get("isModerated") else "working"
+
+
+def _chunk(arr, size):
+    for i in range(0, len(arr), size):
+        yield arr[i:i + size]
+
+
+# ================================================================
+# CLIENT
+# ================================================================
+
+class RobloxClient:
+    def __init__(self, cookie: str):
+        cookie = cookie.strip().strip('"').strip("'")
+        if cookie.startswith(".ROBLOSECURITY="):
+            cookie = cookie[len(".ROBLOSECURITY="):]
+        self._cookie = cookie
+        self._csrf: Optional[str] = None
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._plain: Optional[aiohttp.ClientSession] = None  # no cookie, used for CDN downloads
+        self._join_lock = asyncio.Lock()
+        self._last_join = 0.0
+        self.user: Optional[dict] = None
+
+    async def start(self):
+        self._session = aiohttp.ClientSession(
+            headers={
+                "User-Agent": CFG["UserAgent"],
+                "Origin": CFG["Origin"],
+                "Referer": CFG["Origin"] + "/",
+                "Cookie": f".ROBLOSECURITY={self._cookie}",
+            },
+            timeout=aiohttp.ClientTimeout(total=30),
+        )
+        self._plain = aiohttp.ClientSession(
+            headers={"User-Agent": CFG["UserAgent"]},
+            timeout=aiohttp.ClientTimeout(total=60),
+        )
+        self.user = await self.get_me()
+
+    async def close(self):
+        if self._session:
+            await self._session.close()
+        if self._plain:
+            await self._plain.close()
+
+    # ---------- core request: CSRF retry, 429 backoff, challenge detection ----------
+
+    async def _request(self, method: str, url: str, *, params=None, json=None):
+        last_err = "unknown error"
+        for attempt in range(CFG["MaxRetries"]):
+            headers = {"x-csrf-token": self._csrf} if self._csrf else {}
+            try:
+                async with self._session.request(
+                    method, url, params=params, json=json, headers=headers
+                ) as res:
+                    text = await res.text()
+
+                    if "rblx-challenge-id" in res.headers:
+                        raise ChallengeRequired("Roblox wants a captcha/challenge for this action.")
+
+                    new_csrf = res.headers.get("x-csrf-token")
+                    if res.status == 403 and new_csrf and new_csrf != self._csrf:
+                        self._csrf = new_csrf
+                        continue  # retry with the fresh token
+
+                    if res.status == 429:
+                        wait = float(res.headers.get("retry-after", 2 * (attempt + 1)))
+                        await asyncio.sleep(min(wait, 15))
+                        last_err = "429 rate limited"
+                        continue
+
+                    if res.status == 401:
+                        raise AuthError("401 — the .ROBLOSECURITY cookie is invalid or expired.")
+
+                    if not res.ok:
+                        raise RobloxError(f"{res.status} — {self._extract_error(text)}")
+
+                    if not text:
+                        return {}
+                    try:
+                        return await res.json(content_type=None)
+                    except Exception:
+                        return {}
+            except aiohttp.ClientError as e:
+                last_err = f"network error: {e}"
+                await asyncio.sleep(1 + attempt)
+        raise RobloxError(f"Gave up after retries ({last_err})")
+
+    @staticmethod
+    def _extract_error(text: str) -> str:
+        import json as _json
+        try:
+            data = _json.loads(text)
+            errs = data.get("errors") or []
+            if errs:
+                return errs[0].get("message") or errs[0].get("userFacingMessage") or text[:200]
+        except Exception:
+            pass
+        return (text or "no body")[:200]
+
+    # ---------- account / groups ----------
+
+    async def get_me(self) -> dict:
+        return await self._request("GET", "https://users.roblox.com/v1/users/authenticated")
+
+    async def in_group(self, group_id: int) -> bool:
+        data = await self._request(
+            "GET", f"https://groups.roblox.com/v1/users/{self.user['id']}/groups/roles"
+        )
+        return any(int(g["group"]["id"]) == int(group_id) for g in data.get("data", []))
+
+    async def group_info(self, group_id: int) -> GroupInfo:
+        d = await self._request("GET", f"https://groups.roblox.com/v1/groups/{group_id}")
+        return GroupInfo(
+            id=int(d["id"]),
+            name=d.get("name", "Unknown group"),
+            public_entry=bool(d.get("publicEntryAllowed")),
+            locked=bool(d.get("isLocked")),
+            member_count=int(d.get("memberCount") or 0),
+        )
+
+    async def join_group(self, group_id: int) -> str:
+        """Returns: 'joined' | 'pending' | 'already'. Raises ChallengeRequired / RobloxError."""
+        async with self._join_lock:
+            if await self.in_group(group_id):
+                return "already"
+
+            # Cooldown so rapid joins don't get the account flagged.
+            wait = CFG["JoinCooldownSeconds"] - (time.monotonic() - self._last_join)
+            if wait > 0 and self._last_join:
+                await asyncio.sleep(wait)
+
+            await self._request("POST", f"https://groups.roblox.com/v1/groups/{group_id}/users", json={})
+            self._last_join = time.monotonic()
+
+            await asyncio.sleep(1.5)
+            return "joined" if await self.in_group(group_id) else "pending"
+
+    # ---------- audio ----------
+
+    async def list_group_audio(self, group_id: int) -> list[dict]:
+        items, cursor, pages = [], "", 0
+        while True:
+            params = {"assetType": "Audio", "groupId": str(group_id), "limit": str(CFG["ListPageLimit"])}
+            if cursor:
+                params["cursor"] = cursor
+            data = await self._request(
+                "GET", "https://itemconfiguration.roblox.com/v1/creations/get-assets", params=params
+            )
+            for it in data.get("data", []):
+                try:
+                    if int(it["assetId"]) > 0:
+                        items.append(it)
+                except (KeyError, ValueError, TypeError):
+                    continue
+            cursor = data.get("nextPageCursor") or ""
+            pages += 1
+            if not cursor or pages >= CFG["MaxListPages"]:
+                break
+        return items  # [{ name, assetId }]
+
+    async def asset_details(self, asset_ids: list[int]) -> dict[str, dict]:
+        """Moderation info from develop.roblox.com. One bad ID never sinks the whole batch."""
+        out: dict[str, dict] = {}
+
+        async def fetch(ids: list[int]):
+            data = await self._request(
+                "GET", "https://develop.roblox.com/v1/assets",
+                params={"assetIds": ",".join(str(i) for i in ids)},
+            )
+            for d in data.get("data", []):
+                out[str(d.get("id"))] = d
+
+        for batch in _chunk(asset_ids, CFG["StatusChunkSize"]):
+            try:
+                await fetch(batch)
+            except (AuthError, ChallengeRequired):
+                raise
+            except RobloxError:
+                if len(batch) == 1:
+                    continue
+                for aid in batch:
+                    try:
+                        await fetch([aid])
+                    except (AuthError, ChallengeRequired):
+                        raise
+                    except RobloxError:
+                        continue
+        return out
+
+    async def economy_details(self, asset_id: int) -> Optional[dict]:
+        """Public asset info: name, description, creator, dates, asset type."""
+        try:
+            return await self._request("GET", f"https://economy.roblox.com/v2/assets/{asset_id}/details")
+        except (AuthError, ChallengeRequired):
+            raise
+        except RobloxError:
+            return None
+
+    async def asset_name_fallback(self, asset_id: int) -> Optional[str]:
+        d = await self.economy_details(asset_id)
+        return d.get("Name") if d else None
+
+    async def toolbox_audio_info(self, asset_id: int) -> dict:
+        """Best effort: artist / genre / album / duration from the Creator Store. Silent on failure."""
+        try:
+            d = await self._request(
+                "GET", "https://apis.roblox.com/toolbox-service/v1/items/details",
+                params={"assetIds": str(asset_id)},
+            )
+        except RobloxError:
+            return {}
+        out = {}
+        for key, names in (
+            ("duration", ("duration",)),
+            ("artist", ("artist",)),
+            ("album", ("albumTitle", "album")),
+            ("genre", ("genre", "musicType")),
+        ):
+            v = _find_key(d, names)
+            if v not in (None, ""):
+                out[key] = v
+        return out
+
+    async def group_icon(self, group_id: int) -> Optional[str]:
+        try:
+            d = await self._request(
+                "GET", "https://thumbnails.roblox.com/v1/groups/icons",
+                params={"groupIds": str(group_id), "size": "150x150", "format": "Png", "isCircular": "false"},
+            )
+        except RobloxError:
+            return None
+        item = (d.get("data") or [{}])[0]
+        return item.get("imageUrl") if item.get("state") == "Completed" else None
+
+    # ---------- audio file download ----------
+
+    async def audio_download_url(self, asset_id: int) -> str:
+        err = "no download location returned"
+        try:
+            d = await self._request("GET", f"https://assetdelivery.roblox.com/v2/assetId/{asset_id}")
+            for loc in d.get("locations") or []:
+                if loc.get("location"):
+                    return loc["location"]
+        except (AuthError, ChallengeRequired):
+            raise
+        except RobloxError as e:
+            err = str(e)
+
+        # v1 fallback: it answers with a redirect to the CDN. Don't follow it with our cookie attached.
+        try:
+            async with self._session.get(
+                "https://assetdelivery.roblox.com/v1/asset/",
+                params={"id": str(asset_id)}, allow_redirects=False,
+            ) as res:
+                loc = res.headers.get("Location")
+                if res.status in (301, 302, 303, 307, 308) and loc:
+                    return loc
+                err = f"{res.status} from asset delivery"
+        except aiohttp.ClientError as e:
+            err = f"network error: {e}"
+        raise RobloxError(err)
+
+    async def download_audio(self, asset_id: int) -> bytes:
+        url = await self.audio_download_url(asset_id)
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not (parsed.hostname or "").endswith(".rbxcdn.com"):
+            raise RobloxError("Asset delivery pointed somewhere that isn't Roblox's CDN.")
+
+        buf = bytearray()
+        try:
+            async with self._plain.get(url) as res:
+                if not res.ok:
+                    raise RobloxError(f"{res.status} downloading the audio file")
+                async for part in res.content.iter_chunked(64 * 1024):
+                    buf.extend(part)
+                    if len(buf) > CFG["MaxAudioBytes"]:
+                        raise RobloxError("Audio file is too large to analyze.")
+        except aiohttp.ClientError as e:
+            raise RobloxError(f"network error downloading audio: {e}")
+        return bytes(buf)
+
+
+# ================================================================
+# HELPERS
+# ================================================================
+
+def _find_key(obj, names: tuple):
+    """First scalar value stored under any of `names`, searching nested dicts/lists."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            for k, v in cur.items():
+                if k in names and v not in (None, "") and not isinstance(v, (dict, list)):
+                    return v
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return None
