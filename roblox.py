@@ -4,6 +4,7 @@
 
 import asyncio
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -315,6 +316,133 @@ class RobloxClient:
             return None
         item = (d.get("data") or [{}])[0]
         return item.get("imageUrl") if item.get("state") == "Completed" else None
+
+    # ---------- public lookups (users, groups, assets, games, badges) ----------
+
+    async def _safe(self, coro):
+        """Runs a request and returns None if Roblox refuses it. Auth/challenge errors still propagate."""
+        try:
+            return await coro
+        except (AuthError, ChallengeRequired):
+            raise
+        except RobloxError:
+            return None
+
+    async def _thumb(self, url: str, params: dict) -> Optional[str]:
+        """First completed thumbnail URL, retrying once if Roblox is still rendering it."""
+        for attempt in range(2):
+            d = await self._safe(self._request("GET", url, params=params))
+            item = ((d or {}).get("data") or [{}])[0]
+            if item.get("state") == "Completed" and item.get("imageUrl"):
+                return item["imageUrl"]
+            if item.get("state") not in ("Pending", "InReview"):
+                return None
+            await asyncio.sleep(1.5)
+        return None
+
+    async def user_details(self, user_id: int) -> Optional[dict]:
+        try:
+            return await self._request("GET", f"https://users.roblox.com/v1/users/{user_id}")
+        except (AuthError, ChallengeRequired):
+            raise
+        except RobloxError as e:
+            if str(e)[:3] in ("400", "404"):
+                return None
+            raise
+
+    async def resolve_user(self, query: str) -> Optional[dict]:
+        """Accepts a username, @username, numeric ID, or a roblox.com/users/<id>/profile link."""
+        q = (query or "").strip()
+        m = re.search(r"roblox\.com/(?:[a-z-]+/)?users/(\d+)", q, re.I)
+        if m or q.isdigit():
+            return await self.user_details(int(m.group(1) if m else q))
+        name = q.lstrip("@").strip()
+        if not name:
+            return None
+        d = await self._request(
+            "POST", "https://users.roblox.com/v1/usernames/users",
+            json={"usernames": [name], "excludeBannedUsers": False},
+        )
+        hits = d.get("data") or []
+        return await self.user_details(int(hits[0]["id"])) if hits else None
+
+    async def user_count(self, user_id: int, kind: str) -> Optional[int]:
+        """kind: friends | followers | followings"""
+        d = await self._safe(self._request("GET", f"https://friends.roblox.com/v1/users/{user_id}/{kind}/count"))
+        return d.get("count") if isinstance(d, dict) and "count" in d else None
+
+    async def username_history(self, user_id: int) -> list[str]:
+        d = await self._safe(self._request(
+            "GET", f"https://users.roblox.com/v1/users/{user_id}/username-history",
+            params={"limit": "10", "sortOrder": "Desc"}))
+        return [x["name"] for x in (d or {}).get("data", []) if x.get("name")]
+
+    async def user_groups(self, user_id: int) -> list[dict]:
+        """[{ group: {id, name, memberCount, hasVerifiedBadge}, role: {name, rank} }]"""
+        d = await self._safe(self._request("GET", f"https://groups.roblox.com/v2/users/{user_id}/groups/roles"))
+        return (d or {}).get("data", [])
+
+    async def user_headshot(self, user_id: int) -> Optional[str]:
+        return await self._thumb("https://thumbnails.roblox.com/v1/users/avatar-headshot", {
+            "userIds": str(user_id), "size": "420x420", "format": "Png", "isCircular": "false"})
+
+    async def user_avatar(self, user_id: int) -> Optional[str]:
+        return await self._thumb("https://thumbnails.roblox.com/v1/users/avatar", {
+            "userIds": str(user_id), "size": "720x720", "format": "Png", "isCircular": "false"})
+
+    async def group_details(self, group_id: int) -> Optional[dict]:
+        try:
+            return await self._request("GET", f"https://groups.roblox.com/v1/groups/{group_id}")
+        except (AuthError, ChallengeRequired):
+            raise
+        except RobloxError as e:
+            if str(e)[:3] in ("400", "404"):
+                return None
+            raise
+
+    async def group_roles(self, group_id: int) -> list[dict]:
+        d = await self._safe(self._request("GET", f"https://groups.roblox.com/v1/groups/{group_id}/roles"))
+        return (d or {}).get("roles", [])
+
+    async def asset_thumbnail(self, asset_id: int) -> Optional[str]:
+        return await self._thumb("https://thumbnails.roblox.com/v1/assets", {
+            "assetIds": str(asset_id), "returnPolicy": "PlaceHolder", "size": "420x420",
+            "format": "Png", "isCircular": "false"})
+
+    async def universe_from_place(self, place_id: int) -> Optional[int]:
+        d = await self._safe(self._request("GET", f"https://apis.roblox.com/universes/v1/places/{place_id}/universe"))
+        uid = (d or {}).get("universeId")
+        return int(uid) if uid else None
+
+    async def game_details(self, universe_id: int) -> Optional[dict]:
+        d = await self._safe(self._request(
+            "GET", "https://games.roblox.com/v1/games", params={"universeIds": str(universe_id)}))
+        data = (d or {}).get("data") or []
+        return data[0] if data else None
+
+    async def game_votes(self, universe_id: int) -> Optional[dict]:
+        d = await self._safe(self._request(
+            "GET", "https://games.roblox.com/v1/games/votes", params={"universeIds": str(universe_id)}))
+        data = (d or {}).get("data") or []
+        return data[0] if data else None
+
+    async def game_icon(self, universe_id: int) -> Optional[str]:
+        return await self._thumb("https://thumbnails.roblox.com/v1/games/icons", {
+            "universeIds": str(universe_id), "size": "256x256", "format": "Png", "isCircular": "false"})
+
+    async def badge_details(self, badge_id: int) -> Optional[dict]:
+        try:
+            return await self._request("GET", f"https://badges.roblox.com/v1/badges/{badge_id}")
+        except (AuthError, ChallengeRequired):
+            raise
+        except RobloxError as e:
+            if str(e)[:3] in ("400", "404"):
+                return None
+            raise
+
+    async def badge_icon(self, badge_id: int) -> Optional[str]:
+        return await self._thumb("https://thumbnails.roblox.com/v1/badges/icons", {
+            "badgeIds": str(badge_id), "size": "150x150", "format": "Png", "isCircular": "false"})
 
     # ---------- audio file download ----------
 

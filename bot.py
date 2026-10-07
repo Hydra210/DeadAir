@@ -623,6 +623,356 @@ async def whoami(interaction: discord.Interaction):
 
 
 # ================================================================
+# LOOKUPS: users, groups, assets, games, badges
+# ================================================================
+
+ASSET_TYPES = {
+    1: "Image", 2: "T-Shirt", 3: "Audio", 4: "Mesh", 5: "Lua script", 8: "Hat", 9: "Place", 10: "Model",
+    11: "Shirt", 12: "Pants", 13: "Decal", 17: "Head", 18: "Face", 19: "Gear", 21: "Badge",
+    24: "Animation", 27: "Torso", 28: "Right arm", 29: "Left arm", 30: "Left leg", 31: "Right leg",
+    32: "Package", 34: "Game pass", 38: "Plugin", 40: "Mesh part", 41: "Hair accessory",
+    42: "Face accessory", 43: "Neck accessory", 44: "Shoulder accessory", 45: "Front accessory",
+    46: "Back accessory", 47: "Waist accessory", 48: "Climb animation", 49: "Death animation",
+    50: "Fall animation", 51: "Idle animation", 52: "Jump animation", 53: "Run animation",
+    54: "Swim animation", 55: "Walk animation", 56: "Pose animation", 59: "Ear accessory",
+    60: "Eye accessory", 61: "Emote animation", 62: "Video", 63: "T-Shirt accessory",
+    64: "Shirt accessory", 65: "Pants accessory", 66: "Jacket accessory", 67: "Sweater accessory",
+    68: "Shorts accessory", 69: "Left shoe accessory", 70: "Right shoe accessory",
+    71: "Dress/skirt accessory", 72: "Font family", 73: "Font face", 75: "Eyebrow accessory",
+    76: "Eyelash accessory", 77: "Mood animation", 78: "Dynamic head",
+}
+
+
+def clip(text: Optional[str], limit: int) -> str:
+    t = " ".join((text or "").split())
+    return t if len(t) <= limit else t[: limit - 3] + "..."
+
+
+def num(n) -> str:
+    try:
+        return f"{int(n):,}"
+    except (TypeError, ValueError):
+        return "Unknown"
+
+
+def when(value: Optional[str], style: str = "D") -> str:
+    ts = parse_ts(value)
+    return f"<t:{ts}:{style}>" if ts else "Unknown"
+
+
+def profile_url(uid) -> str:
+    return f"https://www.roblox.com/users/{uid}/profile"
+
+
+def creator_link(name: Optional[str], kind: Optional[str], cid) -> str:
+    label = link_text(name, 40)
+    if not cid:
+        return label
+    return f"[{label}]({group_url(cid) if kind == 'Group' else profile_url(cid)})"
+
+
+def not_found(what: str, detail: str) -> discord.Embed:
+    return error_embed(detail, f"{what} not found")
+
+
+# ---------- users ----------
+
+def build_user_card(u: dict, counts: dict, history: list, group_count: int,
+                    headshot: Optional[str]) -> discord.Embed:
+    uid = u.get("id")
+    banned = bool(u.get("isBanned"))
+    e = discord.Embed(
+        title=link_text(u.get("displayName") or u.get("name"), 200), url=profile_url(uid),
+        description=clip(u.get("description"), 300) or None,
+        color=COLORS["bad"] if banned else COLORS["base"])
+    status = "Banned" if banned else "Active"
+    if u.get("hasVerifiedBadge"):
+        status += ", verified"
+    e.add_field(name="Username", value=f"@{link_text(u.get('name'), 30)}", inline=True)
+    e.add_field(name="User ID", value=f"`{uid}`", inline=True)
+    e.add_field(name="Status", value=status, inline=True)
+    e.add_field(name="Joined", value=when(u.get("created")), inline=True)
+    e.add_field(name="Friends", value=num(counts.get("friends")), inline=True)
+    e.add_field(name="Followers", value=num(counts.get("followers")), inline=True)
+    e.add_field(name="Following", value=num(counts.get("followings")), inline=True)
+    e.add_field(name="Groups", value=num(group_count), inline=True)
+    if history:
+        e.add_field(name="Past usernames",
+                    value=clip(", ".join(link_text(n, 24) for n in history[:5]), 200), inline=False)
+    if headshot:
+        e.set_thumbnail(url=headshot)
+    e.set_footer(text=CFG["Footer"])
+    return e
+
+
+async def find_user(interaction: discord.Interaction, query: str) -> Optional[dict]:
+    u = await bot.rbx.resolve_user(query)
+    if not u:
+        await show(interaction, not_found("User", f"I couldn't find a Roblox user for `{link_text(query, 60)}`."))
+    return u
+
+
+@bot.tree.command(name="user", description="Look up a Roblox user by username, ID, or profile link")
+@app_commands.describe(user="Username, user ID, or a roblox.com profile link")
+async def user_cmd(interaction: discord.Interaction, user: str):
+    await interaction.response.defer(thinking=True)
+    u = await find_user(interaction, user)
+    if not u:
+        return
+    uid = int(u["id"])
+    rbx = bot.rbx
+    friends, followers, following, history, groups, head = await asyncio.gather(
+        rbx.user_count(uid, "friends"), rbx.user_count(uid, "followers"), rbx.user_count(uid, "followings"),
+        rbx.username_history(uid), rbx.user_groups(uid), rbx.user_headshot(uid))
+    counts = {"friends": friends, "followers": followers, "followings": following}
+    await show(interaction, build_user_card(u, counts, history, len(groups), head))
+
+
+@bot.tree.command(name="avatar", description="Show a Roblox user's current avatar")
+@app_commands.describe(user="Username, user ID, or a roblox.com profile link")
+async def avatar_cmd(interaction: discord.Interaction, user: str):
+    await interaction.response.defer(thinking=True)
+    u = await find_user(interaction, user)
+    if not u:
+        return
+    url = await bot.rbx.user_avatar(int(u["id"]))
+    if not url:
+        await show(interaction, error_embed(
+            "Roblox hasn't finished rendering that avatar yet. Try again in a few seconds.", "Avatar not ready"))
+        return
+    e = make_embed(f"{link_text(u.get('displayName') or u.get('name'), 100)} (@{link_text(u.get('name'), 30)})")
+    e.url = profile_url(u["id"])
+    e.set_image(url=url)
+    await show(interaction, e)
+
+
+@bot.tree.command(name="usergroups", description="List the groups a Roblox user is in")
+@app_commands.describe(user="Username, user ID, or a roblox.com profile link")
+async def usergroups_cmd(interaction: discord.Interaction, user: str):
+    await interaction.response.defer(thinking=True)
+    u = await find_user(interaction, user)
+    if not u:
+        return
+    uid = int(u["id"])
+    groups, head = await asyncio.gather(bot.rbx.user_groups(uid), bot.rbx.user_headshot(uid))
+    who = f"[{link_text(u.get('name'), 30)}]({profile_url(uid)})"
+    if not groups:
+        await show(interaction, make_embed("No groups", f"{who} isn't in any groups, or Roblox didn't return them."))
+        return
+    groups.sort(key=lambda g: ((g.get("role") or {}).get("rank") or 0, g["group"].get("memberCount") or 0),
+                reverse=True)
+    lines = [f"[{link_text(g['group'].get('name'))}]({group_url(g['group']['id'])})  `{g['group']['id']}`  "
+             f"{link_text((g.get('role') or {}).get('name'), 24)}  |  {num(g['group'].get('memberCount'))} members"
+             for g in groups]
+    pager = Pager(interaction.user.id, "Groups", f"{who} is in {len(groups)} groups.", lines,
+                  f"{len(lines)} groups", COLORS["base"], head)
+    pager.message = await show(interaction, pager.embed(), view=pager)
+
+
+# ---------- groups ----------
+
+def build_group_card(d: dict, roles: list, icon: Optional[str]) -> discord.Embed:
+    gid = d.get("id")
+    e = discord.Embed(title=link_text(d.get("name"), 200), url=group_url(gid),
+                      description=clip(d.get("description"), 300) or None, color=COLORS["base"])
+    owner = d.get("owner") or {}
+    owner_text = (f"[{link_text(owner.get('username'), 30)}]({profile_url(owner['userId'])})"
+                  if owner.get("userId") else "No owner")
+    entry = "Locked" if d.get("isLocked") else ("Open to join" if d.get("publicEntryAllowed") else "Approval required")
+    e.add_field(name="Group ID", value=f"`{gid}`", inline=True)
+    e.add_field(name="Members", value=num(d.get("memberCount")), inline=True)
+    e.add_field(name="Owner", value=owner_text, inline=True)
+    e.add_field(name="Joining", value=entry, inline=True)
+    e.add_field(name="Verified", value="Yes" if d.get("hasVerifiedBadge") else "No", inline=True)
+
+    shout = d.get("shout") or {}
+    if shout.get("body"):
+        e.add_field(name="Shout", value=clip(shout["body"], 200) + f"\n{when(shout.get('updated'), 'R')}", inline=False)
+
+    if roles:
+        ordered = sorted(roles, key=lambda r: r.get("rank") or 0, reverse=True)
+        lines = [f"{link_text(r.get('name'), 30)}  (rank {r.get('rank')}, {num(r.get('memberCount'))} members)"
+                 for r in ordered[:8]]
+        if len(ordered) > 8:
+            lines.append(f"...and {len(ordered) - 8} more roles")
+        e.add_field(name=f"Roles ({len(ordered)})", value="\n".join(lines), inline=False)
+    if icon:
+        e.set_thumbnail(url=icon)
+    e.set_footer(text=CFG["Footer"])
+    return e
+
+
+@bot.tree.command(name="group", description="Look up a Roblox group by ID or link")
+@app_commands.describe(group="Group ID or a roblox.com group link")
+async def group_cmd(interaction: discord.Interaction, group: str):
+    await interaction.response.defer(thinking=True)
+    gid = parse_id(group, "group ID")
+    d, roles, icon = await asyncio.gather(
+        bot.rbx.group_details(gid), bot.rbx.group_roles(gid), bot.rbx.group_icon(gid))
+    if not d:
+        await show(interaction, not_found("Group", f"There's no group with the ID `{gid}`."))
+        return
+    await show(interaction, build_group_card(d, roles, icon))
+
+
+# ---------- assets ----------
+
+def build_asset_card(aid: int, econ: dict, dev: Optional[dict], thumb: Optional[str]) -> discord.Embed:
+    type_id = econ.get("AssetTypeId")
+    type_name = ASSET_TYPES.get(type_id, f"Type {type_id}")
+    url = asset_url(aid) if type_id == 3 else f"https://www.roblox.com/catalog/{aid}"
+    e = discord.Embed(title=link_text(econ.get("Name") or f"Asset {aid}", 200), url=url,
+                      description=clip(econ.get("Description"), 300) or None, color=COLORS["base"])
+
+    status = status_to_working(dev) if dev else None
+    if status == "broken":
+        e.color = COLORS["bad"]
+
+    creator = econ.get("Creator") or {}
+    cid = creator.get("CreatorTargetId") or creator.get("Id")
+    if econ.get("IsForSale"):
+        price = econ.get("PriceInRobux")
+        price_text = "On sale" if price is None else ("Free" if price == 0 else f"R$ {num(price)}")
+    else:
+        price_text = "Not for sale"
+
+    e.add_field(name="Type", value=type_name, inline=True)
+    e.add_field(name="Asset ID", value=f"`{aid}`", inline=True)
+    e.add_field(name="Creator", value=creator_link(creator.get("Name"), creator.get("CreatorType"), cid), inline=True)
+    e.add_field(name="Created", value=when(econ.get("Created")), inline=True)
+    e.add_field(name="Updated", value=when(econ.get("Updated"), "R"), inline=True)
+    e.add_field(name="Price", value=price_text, inline=True)
+    if econ.get("Sales"):
+        e.add_field(name="Sales", value=num(econ["Sales"]), inline=True)
+    if econ.get("IsLimitedUnique") or econ.get("IsLimited"):
+        e.add_field(name="Limited", value="Limited U" if econ.get("IsLimitedUnique") else "Limited", inline=True)
+    e.add_field(name="Free to use", value="Yes" if econ.get("IsPublicDomain") else "No", inline=True)
+    if status:
+        e.add_field(name="Moderation", value=LABELS[status], inline=True)
+    if type_id == 3:
+        e.add_field(name="Audio", value="Run `/check` with this ID for length, loudness and a waveform.", inline=False)
+    if thumb:
+        e.set_thumbnail(url=thumb)
+    e.set_footer(text=CFG["Footer"])
+    return e
+
+
+@bot.tree.command(name="asset", description="Look up any Roblox asset (audio, model, shirt, decal, place, ...)")
+@app_commands.describe(asset_id="Asset ID or a roblox.com / create.roblox.com link")
+async def asset_cmd(interaction: discord.Interaction, asset_id: str):
+    await interaction.response.defer(thinking=True)
+    aid = parse_id(asset_id, "asset ID")
+    econ = await bot.rbx.economy_details(aid)
+    if not econ:
+        await show(interaction, not_found("Asset", f"No asset with the ID `{aid}` was found."))
+        return
+    details, thumb = await asyncio.gather(bot.rbx.asset_details([aid]), bot.rbx.asset_thumbnail(aid))
+    await show(interaction, build_asset_card(aid, econ, details.get(str(aid)), thumb))
+
+
+# ---------- games ----------
+
+def build_game_card(d: dict, votes: Optional[dict], icon: Optional[str]) -> discord.Embed:
+    place = d.get("rootPlaceId")
+    e = discord.Embed(title=link_text(d.get("name"), 200), url=f"https://www.roblox.com/games/{place}",
+                      description=clip(d.get("description"), 300) or None, color=COLORS["base"])
+    c = d.get("creator") or {}
+    e.add_field(name="Playing now", value=num(d.get("playing")), inline=True)
+    e.add_field(name="Visits", value=num(d.get("visits")), inline=True)
+    e.add_field(name="Favorites", value=num(d.get("favoritedCount")), inline=True)
+    if votes:
+        up, down = votes.get("upVotes") or 0, votes.get("downVotes") or 0
+        pct = f" ({up / (up + down) * 100:.0f}%)" if up + down else ""
+        e.add_field(name="Likes", value=f"{num(up)}{pct}", inline=True)
+        e.add_field(name="Dislikes", value=num(down), inline=True)
+    e.add_field(name="Max players", value=num(d.get("maxPlayers")), inline=True)
+    e.add_field(name="Creator", value=creator_link(c.get("name"), c.get("type"), c.get("id")), inline=True)
+    if d.get("genre"):
+        e.add_field(name="Genre", value=link_text(d["genre"], 30), inline=True)
+    e.add_field(name="Created", value=when(d.get("created")), inline=True)
+    e.add_field(name="Updated", value=when(d.get("updated"), "R"), inline=True)
+    e.add_field(name="Place ID", value=f"`{place}`", inline=True)
+    e.add_field(name="Universe ID", value=f"`{d.get('id')}`", inline=True)
+    if icon:
+        e.set_thumbnail(url=icon)
+    e.set_footer(text=CFG["Footer"])
+    return e
+
+
+@bot.tree.command(name="game", description="Look up a Roblox game by place ID, universe ID, or link")
+@app_commands.describe(game="Place ID, universe ID, or a roblox.com/games link")
+async def game_cmd(interaction: discord.Interaction, game: str):
+    await interaction.response.defer(thinking=True)
+    n = parse_id(game, "game ID")
+    universe = await bot.rbx.universe_from_place(n) or n  # a place ID resolves to its universe; otherwise try it as one
+    d = await bot.rbx.game_details(universe)
+    if not d:
+        await show(interaction, not_found("Game", f"No game with the place or universe ID `{n}` was found."))
+        return
+    votes, icon = await asyncio.gather(bot.rbx.game_votes(universe), bot.rbx.game_icon(universe))
+    await show(interaction, build_game_card(d, votes, icon))
+
+
+# ---------- badges ----------
+
+def build_badge_card(d: dict, icon: Optional[str]) -> discord.Embed:
+    e = discord.Embed(title=link_text(d.get("name"), 200), url=f"https://www.roblox.com/badges/{d.get('id')}",
+                      description=clip(d.get("description"), 300) or None, color=COLORS["base"])
+    stats = d.get("statistics") or {}
+    win = stats.get("winRatePercentage")
+    e.add_field(name="Badge ID", value=f"`{d.get('id')}`", inline=True)
+    e.add_field(name="Status", value="Enabled" if d.get("enabled") else "Disabled", inline=True)
+    e.add_field(name="Awarded", value=num(stats.get("awardedCount")), inline=True)
+    e.add_field(name="Past day", value=num(stats.get("pastDayAwardedCount")), inline=True)
+    if isinstance(win, (int, float)):
+        e.add_field(name="Win rate", value=f"{win * 100:.2f}%", inline=True)
+    e.add_field(name="Created", value=when(d.get("created")), inline=True)
+    game = d.get("awardingUniverse") or {}
+    if game.get("name"):
+        place = game.get("rootPlaceId")
+        label = link_text(game["name"], 40)
+        e.add_field(name="Game", value=f"[{label}](https://www.roblox.com/games/{place})" if place else label,
+                    inline=False)
+    if icon:
+        e.set_thumbnail(url=icon)
+    e.set_footer(text=CFG["Footer"])
+    return e
+
+
+@bot.tree.command(name="badge", description="Look up a Roblox badge by ID")
+@app_commands.describe(badge_id="Badge ID or a roblox.com badge link")
+async def badge_cmd(interaction: discord.Interaction, badge_id: str):
+    await interaction.response.defer(thinking=True)
+    bid = parse_id(badge_id, "badge ID")
+    d = await bot.rbx.badge_details(bid)
+    if not d:
+        await show(interaction, not_found("Badge", f"There's no badge with the ID `{bid}`."))
+        return
+    await show(interaction, build_badge_card(d, await bot.rbx.badge_icon(bid)))
+
+
+# ---------- help ----------
+
+@bot.tree.command(name="help", description="List everything DeadAir can do")
+async def help_cmd(interaction: discord.Interaction):
+    e = make_embed("DeadAir", "Roblox lookups and audio checking. Everything works in servers and DMs.")
+    e.add_field(name="Audio", value=(
+        "`/check` working or moderated, plus info, loudness and a waveform\n"
+        "`/search` search a group's audio library by name or keyword"), inline=False)
+    e.add_field(name="Lookups", value=(
+        "`/user` profile by username, ID or link\n"
+        "`/avatar` a user's current avatar\n"
+        "`/usergroups` the groups a user is in\n"
+        "`/group` group info by ID or link\n"
+        "`/asset` any asset type by ID\n"
+        "`/game` game info by place or universe ID\n"
+        "`/badge` badge info by ID"), inline=False)
+    e.add_field(name="Bot", value="`/join` make the bot's account join a group\n`/whoami` which account the bot uses",
+                inline=False)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+# ================================================================
 # RUN
 # ================================================================
 

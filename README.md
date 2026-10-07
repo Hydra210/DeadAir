@@ -12,6 +12,14 @@ and what it sounds like (a black-and-white loudness waveform). No emojis, everyt
 | `/search group_id term [exact] [only_moderated]` | Search a group's audio by keyword(s) or exact name |
 | `/join group_id` | Make the bot's Roblox account join a group |
 | `/whoami` | Which Roblox account the bot runs on |
+| `/user user:<name, ID or link>` | Profile card: username, ID, join date, friends/followers/following, groups, past usernames |
+| `/avatar user` | A user's current avatar |
+| `/usergroups user` | Every group a user is in, with their role (paged) |
+| `/group group:<ID or link>` | Group card: owner, members, joining, shout, roles |
+| `/asset asset_id` | Any asset type: type, creator, dates, price, sales, limited, moderation when available |
+| `/game game:<place ID, universe ID or link>` | Playing now, visits, favorites, likes, creator, dates |
+| `/badge badge_id` | Awarded count, win rate, game, status |
+| `/help` | Lists every command |
 
 If the bot's account isn't in a group it needs, the message switches to "Joining group" and the bot joins
 by itself. For `/check` it only joins when it can't get the audio otherwise, so it doesn't pile up groups.
