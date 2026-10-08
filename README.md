@@ -78,6 +78,22 @@ when you only care about the first part of the list. The result always says how 
 it stopped before the end of the group it tells you so and suggests raising `amount`. The hard ceiling for one
 search is 100,000 audios. An older version silently stopped at 2,500, which hid results in big groups.
 
+## Status and profile
+
+The bot rotates its status every 10 seconds between two messages. Edit `STATUS_MESSAGES` and `STATUS_SECONDS`
+near the top of `bot.py` to change the text or timing.
+
+For the profile, Discord's API lets a bot change its **username, avatar and banner**. I found no setting for a
+gradient "profile theme" on bot accounts, so the black-and-white gradient is baked into the banner image. Two are
+in `assets/`: `deadair_banner_gradient.png` (black to white fade) and `deadair_banner_glow.png` (dark with a white
+glow). Upload one on the Bot page of the Developer Portal if it offers a banner field, or run:
+
+    python set_profile.py --banner assets/deadair_banner_gradient.png
+    python set_profile.py --avatar halo_pfp_big.png        (optional)
+    python set_profile.py --banner assets/deadair_banner_glow.png --dry-run     (checks the file, sends nothing)
+
+Profile changes are rate limited, so don't spam it.
+
 ## When Roblox times out (504)
 
 Deep in a big group Roblox's servers sometimes time out. The bot retries those errors, and if a page keeps

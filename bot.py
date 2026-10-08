@@ -18,6 +18,7 @@ from typing import Optional
 import discord
 from aiohttp import web
 from discord import app_commands
+from discord.ext import tasks
 from dotenv import load_dotenv
 
 import audio
@@ -110,6 +111,14 @@ async def show(interaction: discord.Interaction, embed: discord.Embed, *,
 # BOT SETUP
 # ================================================================
 
+# Status messages the bot rotates through (each one shows for STATUS_SECONDS, then it loops).
+STATUS_MESSAGES = [
+    "All your wishes in one bot | DeadAir 2026 \U0001F499",
+    "/help | see it for yourself",
+]
+STATUS_SECONDS = 10
+
+
 class DeadAirTree(app_commands.CommandTree):
     """Commands are open to anyone, so cap how fast one person can burn the shared Roblox account."""
     LIMIT, WINDOW = 8, 30.0
@@ -148,6 +157,7 @@ class DeadAir(discord.Client):
         )
         self.rbx: Optional[RobloxClient] = None
         self.health: Optional[web.AppRunner] = None
+        self._status_i = 0
 
     async def start_health_server(self):
         """Tiny HTTP endpoint so Render's free Web Service has a port to check and an uptime pinger can hit it."""
@@ -166,6 +176,20 @@ class DeadAir(discord.Client):
         await web.TCPSite(self.health, "0.0.0.0", int(port)).start()
         log.info("Health server listening on port %s", port)
 
+    @tasks.loop(seconds=STATUS_SECONDS)
+    async def status_loop(self):
+        text = STATUS_MESSAGES[self._status_i % len(STATUS_MESSAGES)]
+        self._status_i += 1
+        try:
+            await self.change_presence(status=discord.Status.online,
+                                       activity=discord.CustomActivity(name=text))
+        except Exception:
+            log.exception("Couldn't update the status")  # never let this stop the loop
+
+    @status_loop.before_loop
+    async def _before_status_loop(self):
+        await self.wait_until_ready()
+
     async def setup_hook(self):
         await self.start_health_server()
         self.rbx = RobloxClient(CFG["Cookie"])
@@ -182,7 +206,11 @@ class DeadAir(discord.Client):
         await self.tree.sync()
         log.info("Commands synced globally")
 
+        if not self.status_loop.is_running():
+            self.status_loop.start()
+
     async def close(self):
+        self.status_loop.cancel()
         if self.rbx:
             await self.rbx.close()
         if self.health:
