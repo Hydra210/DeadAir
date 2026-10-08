@@ -15,7 +15,7 @@ needs an exact name or an ID, and shows suggestions otherwise.
 |---|---|
 | `/check ids:<one ID>` | Full card: status, length, group (link + ID), dates, loudness stats, waveform image |
 | `/check ids:<several IDs>` | Quick list with name and working/moderated status per ID |
-| `/search group term [exact] [only_moderated]` | Search a group's audio by part of a name, or exact name |
+| `/search group term [exact] [only_moderated] [amount]` | Search a group's audio by part of a name, or exact name. `amount` is `all` (default) or a number like `5000` or `5k` |
 
 **Users** (username, ID, or profile link)
 
@@ -69,6 +69,14 @@ by itself. For `/check` it only joins when it can't get the audio otherwise, so 
 
 Cookie: logged into the Roblox alt in a browser, DevTools (F12) -> Application -> Cookies -> roblox.com ->
 copy `.ROBLOSECURITY`. Don't log that account out afterwards, that kills the cookie.
+
+## How much `/search` scans
+
+Roblox hands out a group's audio 100 at a time, so a group with 20,000 audios means 200 requests. By default
+`/search` scans **all** of them and shows progress while it works. Use `amount` to cap it (`1000`, `5k`, ...)
+when you only care about the first part of the list. The result always says how many audios were scanned, and if
+it stopped before the end of the group it tells you so and suggests raising `amount`. The hard ceiling for one
+search is 100,000 audios. An older version silently stopped at 2,500, which hid results in big groups.
 
 ## Why `/search` can come back empty
 

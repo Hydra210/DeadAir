@@ -555,6 +555,42 @@ async def check(interaction: discord.Interaction, ids: str, group: Optional[str]
                        "Run `/check` with a single ID for the full card.", rows, only_moderated)
 
 
+AMOUNT_SUGGESTIONS = [("All audios", "all"), ("First 500", "500"), ("First 1,000", "1000"),
+                      ("First 2,500", "2500"), ("First 5,000", "5000"), ("First 10,000", "10000"),
+                      ("First 25,000", "25000"), ("First 50,000", "50000")]
+
+
+def parse_amount(raw: Optional[str]) -> Optional[int]:
+    """None means all. Accepts all, 5000, 5,000, 5k, 2.5k."""
+    t = (raw or "all").strip().lower().replace(",", "").replace(" ", "")
+    if t in ("all", "everything", "max", "every", "*", ""):
+        return None
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(k?)", t)
+    if not m:
+        raise RobloxError("Amount must be `all` or a number like `5000` or `5k`.")
+    n = int(float(m.group(1)) * (1000 if m.group(2) else 1))
+    if n < 1:
+        raise RobloxError("Amount must be at least 1.")
+    return n
+
+
+def amount_label(limit: Optional[int]) -> str:
+    return "all audios" if limit is None else f"the first {num(limit)} audios"
+
+
+async def amount_autocomplete(interaction: discord.Interaction, current: str):
+    cur = (current or "").strip().lower()
+    out = [app_commands.Choice(name=n, value=v) for n, v in AMOUNT_SUGGESTIONS
+           if not cur or cur in n.lower() or cur in v]
+    if cur and not any(c.value == cur for c in out):
+        try:
+            parse_amount(cur)
+            out.insert(0, app_commands.Choice(name=f"Use {cur}", value=cur))
+        except RobloxError:
+            pass
+    return out[:25]
+
+
 async def explain_no_match(gid: int, everything: list) -> str:
     """Says WHY a search came back empty, using what Roblox actually returned to the bot."""
     rbx = bot.rbx
@@ -577,6 +613,13 @@ async def explain_no_match(gid: int, everything: list) -> str:
     else:
         sample = ", ".join(f"`{link_text(it.get('name'), 30)}`" for it in everything[:5])
         out += f"\nFirst names the bot saw: {sample}"
+    if meta.get("truncated"):
+        if meta.get("hit_ceiling"):
+            out += (f"\n\n**The scan stopped at the {num(meta.get('limit'))} audio ceiling** and the group has more. "
+                    "That's the most the bot will scan in one search.")
+        else:
+            out += (f"\n\n**The scan stopped at your limit of {num(meta.get('limit'))} audios and the group has more.** "
+                    "Run it again with `amount` set to a bigger number, or `all`.")
     skipped = getattr(rbx, "last_skipped", 0)
     if skipped:
         out += f"\n{skipped} entries were skipped because Roblox hasn't given them an asset ID yet (still processing)."
@@ -589,14 +632,16 @@ async def explain_no_match(gid: int, everything: list) -> str:
     term="Part of an audio name, or the exact name with exact on",
     exact="Match the whole name exactly instead of a part of it",
     only_moderated="Only show the moderated ones",
+    amount="How many audios to scan: all (default), or a number like 5000 or 5k",
 )
 async def search(interaction: discord.Interaction, group: str, term: str, exact: bool = False,
-                 only_moderated: bool = False):
+                 only_moderated: bool = False, amount: Optional[str] = None):
     await interaction.response.defer(thinking=True)
     term = term.strip()
     if not term:
         await show(interaction, error_embed("Give me something to search for.", "Empty search"))
         return
+    limit = parse_amount(amount)  # None = all
 
     gid = await pick_group(interaction, group, strict=True)
     if not gid:
@@ -605,8 +650,20 @@ async def search(interaction: discord.Interaction, group: str, term: str, exact:
     if not info:
         return
 
+    link = f"[{link_text(info.name)}]({group_url(gid)})"
+    last_edit = [0.0]
+
+    async def progress(count: int):
+        now = time.monotonic()
+        if now - last_edit[0] < 2.5:
+            return
+        last_edit[0] = now
+        await show(interaction, make_embed(
+            "Scanning group audio",
+            f"Scanning {amount_label(limit)} in {link}.\n**{num(count)}** audios loaded so far..."))
+
     try:
-        everything = await bot.rbx.list_group_audio(gid)
+        everything = await bot.rbx.list_group_audio(gid, max_items=limit, progress=progress)
     except RobloxError as e:
         if str(e).startswith("403"):
             await show(interaction, error_embed(
@@ -620,7 +677,6 @@ async def search(interaction: discord.Interaction, group: str, term: str, exact:
     matched = [it for it in everything
                if ((it.get("name") or "").lower() == low if exact else low in (it.get("name") or "").lower())]
 
-    link = f"[{link_text(info.name)}]({group_url(gid)})"
     if not matched:
         await show(interaction, make_embed(
             "No matches", f"Nothing matching `{link_text(term, 60)}` in {link} "
@@ -640,8 +696,13 @@ async def search(interaction: discord.Interaction, group: str, term: str, exact:
              "status": status_to_working(details.get(str(m["assetId"])))} for m in matched]
     icon = await bot.rbx.group_icon(gid)
 
+    meta = getattr(bot.rbx, "last_meta", {})
+    scanned = f"Scanned {num(len(everything))} audios"
+    if meta.get("truncated"):
+        scanned += (f", then stopped at {'the ceiling' if meta.get('hit_ceiling') else 'your limit'}. "
+                    "The group has more, so raise `amount` or use `all` to search the rest")
     header = (f"{len(matched)} of {len(everything)} audios in {link} (`{gid}`) match "
-              f"`{link_text(term, 60)}`." + status_note)
+              f"`{link_text(term, 60)}`.\n{scanned}." + status_note)
     await send_results(interaction, "Audio search", header, rows, only_moderated, icon)
 
 
@@ -1120,6 +1181,7 @@ async def game_autocomplete(interaction: discord.Interaction, current: str):
 for _cmd, _param in ((check, "group"), (search, "group"), (join, "group"), (group_cmd, "group")):
     _cmd.autocomplete(_param)(group_autocomplete)
 game_cmd.autocomplete("game")(game_autocomplete)
+search.autocomplete("amount")(amount_autocomplete)
 
 
 # ================================================================

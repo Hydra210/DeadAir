@@ -23,7 +23,7 @@ CFG = {
     "Origin": "https://create.roblox.com",
     "StatusChunkSize": 20,      # develop.roblox.com/v1/assets batch size (same as the extension)
     "ListPageLimit": 100,
-    "MaxListPages": 25,         # ~2500 assets, same cap as the extension
+    "MaxScan": 100_000,         # hard ceiling for "all" (1,000 requests). The old cap was 2,500.
     "MaxRetries": 4,
     "MaxAudioBytes": 30_000_000,  # refuse to download anything bigger than this
     "PlaceId": os.getenv("ROBLOX_PLACE_ID", "1818"),  # sent as Roblox-Place-Id on asset delivery (any public place)
@@ -88,7 +88,7 @@ class RobloxClient:
         self._last_join = 0.0
         self.user: Optional[dict] = None
         self.last_skipped = 0
-        self.last_meta = {"pages": 0, "raw": 0}
+        self.last_meta = {"pages": 0, "raw": 0, "truncated": False, "limit": 0, "hit_ceiling": False}
 
     async def start(self):
         self._session = aiohttp.ClientSession(
@@ -229,7 +229,11 @@ class RobloxClient:
 
     # ---------- audio ----------
 
-    async def list_group_audio(self, group_id: int) -> list[dict]:
+    async def list_group_audio(self, group_id: int, max_items: Optional[int] = None, progress=None) -> list[dict]:
+        """Lists a group's audio. max_items=None means everything (up to CFG['MaxScan']).
+        progress(count) is awaited after every page. self.last_meta says whether the scan stopped early."""
+        ceiling = CFG["MaxScan"]
+        want = min(max_items, ceiling) if max_items else ceiling
         items, cursor, pages, skipped = [], "", 0, 0
         while True:
             params = {"assetType": "Audio", "groupId": str(group_id), "limit": str(CFG["ListPageLimit"])}
@@ -249,10 +253,20 @@ class RobloxClient:
                     continue
             cursor = data.get("nextPageCursor") or ""
             pages += 1
-            if not cursor or pages >= CFG["MaxListPages"]:
+            if progress:
+                try:
+                    await progress(len(items))
+                except Exception:
+                    pass  # a failed progress message must never break the scan
+            if not cursor or len(items) >= want:
                 break
+
+        truncated = bool(cursor)  # Roblox still had more pages when we stopped
+        if len(items) > want:
+            items = items[:want]
         self.last_skipped = skipped  # entries with no asset ID yet (still processing)
-        self.last_meta = {"pages": pages, "raw": len(items) + skipped}
+        self.last_meta = {"pages": pages, "raw": len(items) + skipped, "truncated": truncated,
+                          "limit": want, "hit_ceiling": truncated and want >= ceiling}
         return items  # [{ name, assetId }]
 
     async def asset_details(self, asset_ids: list[int]) -> dict[str, dict]:
