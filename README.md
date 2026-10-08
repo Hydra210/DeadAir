@@ -15,7 +15,7 @@ needs an exact name or an ID, and shows suggestions otherwise.
 |---|---|
 | `/check ids:<one ID>` | Full card: status, length, group (link + ID), dates, loudness stats, waveform image |
 | `/check ids:<several IDs>` | Quick list with name and working/moderated status per ID |
-| `/search group term [exact] [only_moderated] [amount]` | Search a group's audio by part of a name, or exact name. `amount` is `all` (default) or a number like `5000` or `5k` |
+| `/search group term [exact] [only_moderated] [amount]` | Search a group's audio by part of a name, or exact name. `amount` is `all` (default) or a number like `5000` or `5k`. `refresh` forces a rescan |
 
 **Users** (username, ID, or profile link)
 
@@ -77,6 +77,14 @@ Roblox hands out a group's audio 100 at a time, so a group with 20,000 audios me
 when you only care about the first part of the list. The result always says how many audios were scanned, and if
 it stopped before the end of the group it tells you so and suggests raising `amount`. The hard ceiling for one
 search is 100,000 audios. An older version silently stopped at 2,500, which hid results in big groups.
+
+## When Roblox times out (504)
+
+Deep in a big group Roblox's servers sometimes time out. The bot retries those errors, and if a page keeps
+failing it asks for smaller pages. If Roblox still won't answer, you get results for everything loaded so far with
+a warning, instead of losing the whole scan. A scan is kept for 5 minutes, so searching again picks up where it
+stopped, and searching a second term in the same group doesn't rescan. Use `refresh` on `/search` to force a new
+scan (for example right after uploading new audio).
 
 ## Why `/search` can come back empty
 

@@ -25,6 +25,9 @@ CFG = {
     "ListPageLimit": 100,
     "MaxScan": 100_000,         # hard ceiling for "all" (1,000 requests). The old cap was 2,500.
     "MaxRetries": 4,
+    "RetryBackoff": 1.0,        # seconds, doubles per retry (1s, 2s, 4s) for 5xx errors on GET requests
+    "ScanCacheSeconds": 300,    # a group scan is reused/resumed for this long
+    "ScanCacheGroups": 3,       # how many groups' scans to keep in memory
     "MaxAudioBytes": 30_000_000,  # refuse to download anything bigger than this
     "PlaceId": os.getenv("ROBLOX_PLACE_ID", "1818"),  # sent as Roblox-Place-Id on asset delivery (any public place)
     "JoinCooldownSeconds": 30,  # min gap between group joins so the account doesn't get flagged
@@ -88,7 +91,9 @@ class RobloxClient:
         self._last_join = 0.0
         self.user: Optional[dict] = None
         self.last_skipped = 0
-        self.last_meta = {"pages": 0, "raw": 0, "truncated": False, "limit": 0, "hit_ceiling": False}
+        self.last_meta = {"pages": 0, "raw": 0, "truncated": False, "limit": 0, "hit_ceiling": False,
+                          "incomplete": False, "error": None}
+        self._scan_cache: dict[int, dict] = {}  # group_id -> {items, cursor, complete, skipped, ts}
 
     async def start(self):
         self._session = aiohttp.ClientSession(
@@ -151,6 +156,11 @@ class RobloxClient:
 
                     if res.status == 401:
                         raise AuthError("401 — the .ROBLOSECURITY cookie is invalid or expired.")
+
+                    if res.status in (500, 502, 503, 504) and method.upper() == "GET":
+                        last_err = f"{res.status} from Roblox"
+                        await asyncio.sleep(min(CFG["RetryBackoff"] * (2 ** attempt), 8))
+                        continue
 
                     if not res.ok:
                         raise RobloxError(f"{res.status} — {self._extract_error(text)}")
@@ -229,45 +239,81 @@ class RobloxClient:
 
     # ---------- audio ----------
 
-    async def list_group_audio(self, group_id: int, max_items: Optional[int] = None, progress=None) -> list[dict]:
+    async def list_group_audio(self, group_id: int, max_items: Optional[int] = None, progress=None,
+                               refresh: bool = False) -> list[dict]:
         """Lists a group's audio. max_items=None means everything (up to CFG['MaxScan']).
-        progress(count) is awaited after every page. self.last_meta says whether the scan stopped early."""
+
+        - Transient Roblox errors are retried; a page that keeps failing is retried with a smaller page size.
+        - If Roblox still fails partway, what was loaded is returned and last_meta['incomplete'] is set.
+        - The scan is cached for a few minutes, so a repeat search is instant and a broken scan resumes
+          from where it stopped. refresh=True throws the cache away.
+        progress(count) is awaited after every page."""
         ceiling = CFG["MaxScan"]
         want = min(max_items, ceiling) if max_items else ceiling
-        items, cursor, pages, skipped = [], "", 0, 0
-        while True:
-            params = {"assetType": "Audio", "groupId": str(group_id), "limit": str(CFG["ListPageLimit"])}
-            if cursor:
-                params["cursor"] = cursor
-            data = await self._request(
-                "GET", "https://itemconfiguration.roblox.com/v1/creations/get-assets", params=params
-            )
+        now = time.monotonic()
+
+        entry = self._scan_cache.get(group_id)
+        if refresh or not entry or now - entry["ts"] > CFG["ScanCacheSeconds"]:
+            entry = {"items": [], "cursor": "", "complete": False, "skipped": 0, "ts": now}
+            self._scan_cache[group_id] = entry
+        resumed = bool(entry["items"])
+        age = now - entry["ts"]
+        items = entry["items"]
+
+        page_limits = [CFG["ListPageLimit"], 50, 25]
+        li, pages, error = 0, 0, None
+        while not entry["complete"] and len(items) < want:
+            params = {"assetType": "Audio", "groupId": str(group_id), "limit": str(page_limits[li])}
+            if entry["cursor"]:
+                params["cursor"] = entry["cursor"]
+            try:
+                data = await self._request(
+                    "GET", "https://itemconfiguration.roblox.com/v1/creations/get-assets", params=params)
+            except (AuthError, ChallengeRequired):
+                raise
+            except RobloxError as e:
+                transient = str(e).startswith("Gave up after retries")
+                if transient and li < len(page_limits) - 1:
+                    li += 1  # deep pages time out less with smaller pages
+                    continue
+                if not items:
+                    raise  # nothing loaded at all: this is a real failure, not a partial result
+                m = re.search(r"(\d{3}) from Roblox", str(e))
+                error = f"HTTP {m.group(1)}" if m else str(e)
+                break
+
             for it in data.get("data", []):
                 try:
                     if int(it["assetId"]) > 0:
                         items.append(it)
                     else:
-                        skipped += 1
+                        entry["skipped"] += 1
                 except (KeyError, ValueError, TypeError):
-                    skipped += 1
-                    continue
-            cursor = data.get("nextPageCursor") or ""
+                    entry["skipped"] += 1
+            entry["cursor"] = data.get("nextPageCursor") or ""
+            entry["complete"] = not entry["cursor"]
+            entry["ts"] = time.monotonic()
             pages += 1
             if progress:
                 try:
                     await progress(len(items))
                 except Exception:
                     pass  # a failed progress message must never break the scan
-            if not cursor or len(items) >= want:
-                break
 
-        truncated = bool(cursor)  # Roblox still had more pages when we stopped
-        if len(items) > want:
-            items = items[:want]
-        self.last_skipped = skipped  # entries with no asset ID yet (still processing)
-        self.last_meta = {"pages": pages, "raw": len(items) + skipped, "truncated": truncated,
-                          "limit": want, "hit_ceiling": truncated and want >= ceiling}
-        return items  # [{ name, assetId }]
+        # keep only the most recent few groups in memory
+        if len(self._scan_cache) > CFG["ScanCacheGroups"]:
+            for gid_old in sorted(self._scan_cache, key=lambda g: self._scan_cache[g]["ts"])[:-CFG["ScanCacheGroups"]]:
+                self._scan_cache.pop(gid_old, None)
+
+        truncated = (not entry["complete"]) or len(items) > want
+        self.last_skipped = entry["skipped"]  # entries with no asset ID yet (still processing)
+        self.last_meta = {
+            "pages": pages, "raw": len(items) + entry["skipped"], "truncated": truncated and not error,
+            "limit": want, "hit_ceiling": truncated and not error and want >= ceiling,
+            "incomplete": bool(error), "error": error, "resumed": resumed,
+            "from_cache": resumed and pages == 0, "cached_age": age, "page_limit": page_limits[li],
+        }
+        return list(items[:want])  # [{ name, assetId }]
 
     async def asset_details(self, asset_ids: list[int]) -> dict[str, dict]:
         """Moderation info from develop.roblox.com. One bad ID never sinks the whole batch."""

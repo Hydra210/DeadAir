@@ -574,6 +574,11 @@ def parse_amount(raw: Optional[str]) -> Optional[int]:
     return n
 
 
+def ago(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s}s ago" if s < 90 else f"{s // 60} min ago"
+
+
 def amount_label(limit: Optional[int]) -> str:
     return "all audios" if limit is None else f"the first {num(limit)} audios"
 
@@ -613,7 +618,11 @@ async def explain_no_match(gid: int, everything: list) -> str:
     else:
         sample = ", ".join(f"`{link_text(it.get('name'), 30)}`" for it in everything[:5])
         out += f"\nFirst names the bot saw: {sample}"
-    if meta.get("truncated"):
+    if meta.get("incomplete"):
+        out += (f"\n\n**Roblox errored out partway through the scan** ({meta.get('error')}), so only the first "
+                f"{num(len(everything))} audios were searched. Run it again within 5 minutes and it picks up "
+                "where it stopped instead of starting over.")
+    elif meta.get("truncated"):
         if meta.get("hit_ceiling"):
             out += (f"\n\n**The scan stopped at the {num(meta.get('limit'))} audio ceiling** and the group has more. "
                     "That's the most the bot will scan in one search.")
@@ -633,9 +642,10 @@ async def explain_no_match(gid: int, everything: list) -> str:
     exact="Match the whole name exactly instead of a part of it",
     only_moderated="Only show the moderated ones",
     amount="How many audios to scan: all (default), or a number like 5000 or 5k",
+    refresh="Rescan from scratch instead of reusing a scan from the last 5 minutes",
 )
 async def search(interaction: discord.Interaction, group: str, term: str, exact: bool = False,
-                 only_moderated: bool = False, amount: Optional[str] = None):
+                 only_moderated: bool = False, amount: Optional[str] = None, refresh: bool = False):
     await interaction.response.defer(thinking=True)
     term = term.strip()
     if not term:
@@ -663,7 +673,7 @@ async def search(interaction: discord.Interaction, group: str, term: str, exact:
             f"Scanning {amount_label(limit)} in {link}.\n**{num(count)}** audios loaded so far..."))
 
     try:
-        everything = await bot.rbx.list_group_audio(gid, max_items=limit, progress=progress)
+        everything = await bot.rbx.list_group_audio(gid, max_items=limit, progress=progress, refresh=refresh)
     except RobloxError as e:
         if str(e).startswith("403"):
             await show(interaction, error_embed(
@@ -698,7 +708,14 @@ async def search(interaction: discord.Interaction, group: str, term: str, exact:
 
     meta = getattr(bot.rbx, "last_meta", {})
     scanned = f"Scanned {num(len(everything))} audios"
-    if meta.get("truncated"):
+    if meta.get("from_cache"):
+        scanned += f" (reused a scan from {ago(meta.get('cached_age', 0))}, use `refresh` to rescan)"
+    elif meta.get("resumed"):
+        scanned += " (continued a recent scan)"
+    if meta.get("incomplete"):
+        scanned += (f". **Roblox errored out partway ({meta.get('error')}), so this only covers what was loaded.** "
+                    "Run it again within 5 minutes and it picks up where it stopped")
+    elif meta.get("truncated"):
         scanned += (f", then stopped at {'the ceiling' if meta.get('hit_ceiling') else 'your limit'}. "
                     "The group has more, so raise `amount` or use `all` to search the rest")
     header = (f"{len(matched)} of {len(everything)} audios in {link} (`{gid}`) match "
