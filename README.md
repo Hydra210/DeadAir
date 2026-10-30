@@ -206,3 +206,16 @@ Add a free monitor (UptimeRobot, 5 minute interval) that requests `https://<your
 
 The cookie is full access to that account. Keep `.env` out of git, use an alt, never paste the cookie
 anywhere, and log the account out everywhere if it ever leaks.
+
+## Additional commands
+
+- `/dmca asset_id owner work claim contact` creates a private copyright takedown **draft** as a text file. Review and sign it before submitting it yourself; the bot does not send legal notices.
+- `/normalize file target_lufs` applies FFmpeg loudness normalization (default -16 LUFS).
+- `/speed file multiplier` changes speed while approximately preserving pitch.
+- `/pitch file semitones` shifts pitch while approximately preserving duration.
+- `/silence file threshold_db` trims quiet starts/ends without removing interior pauses.
+- `/palette file colors` returns dominant HEX colors and a swatch image.
+- `/imageinfo file strip` displays dimensions, format and basic EXIF, or creates a metadata-free PNG when `strip=true`.
+- `/emoji file` creates a transparent 128×128 PNG.
+
+**Deployment:** Audio commands require the `ffmpeg` executable installed on the host and accessible on PATH. On Render, use a runtime/container with FFmpeg available. Input attachments are capped at 20 MB. Audio outputs are WAV; very long files may exceed Discord's upload limits. Commands sync globally on startup and may take time to appear.

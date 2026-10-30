@@ -23,6 +23,7 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 import alerts
+import extras
 import audio
 import toolkit
 from roblox import (AuthError, ChallengeRequired, GroupInfo, RobloxClient,
@@ -226,6 +227,7 @@ class DeadAir(discord.Client):
 
 
 bot = DeadAir()
+extras.register(bot)
 
 
 @bot.tree.error
