@@ -1344,6 +1344,36 @@ class CursorPager(discord.ui.View):
         await interaction.edit_original_response(embed=self.embed(), view=self)
 
 
+async def resolve_list_usernames(items: list[dict]) -> list[dict]:
+    """Enrich Roblox social-list entries that only contain IDs.
+
+    Preserve the original rows and IDs if Roblox's users endpoint is unavailable.
+    """
+    missing = []
+    for item in items:
+        uid = item.get("id") or item.get("userId")
+        if uid and not (item.get("name") or item.get("username")):
+            try:
+                missing.append(int(uid))
+            except (TypeError, ValueError):
+                pass
+    if not missing:
+        return items
+    try:
+        profiles = await bot.rbx.users_by_ids(missing)
+    except RobloxError:
+        return items
+    result = []
+    for item in items:
+        uid = item.get("id") or item.get("userId")
+        try:
+            profile = profiles.get(int(uid)) if uid else None
+        except (TypeError, ValueError):
+            profile = None
+        result.append({**item, **profile} if profile else item)
+    return result
+
+
 async def list_command(interaction: discord.Interaction, *, title: str, header: str, fetch, fmt,
                        thumbnail: Optional[str] = None, empty: str = "Nothing to show."):
     """fetch(cursor) -> (items, next_cursor). The first page loads now, the rest as you page."""
@@ -1355,6 +1385,7 @@ async def list_command(interaction: discord.Interaction, *, title: str, header: 
         await show(interaction, error_embed(
             f"Roblox wouldn't return this list. It may be private. ({e})", "List unavailable"))
         return
+    items = await resolve_list_usernames(items) if fmt is user_row else items
     rows = [fmt(i) for i in items]
     if not rows:
         e = make_embed(title, (header + "\n\n" if header else "") + empty)
@@ -1365,6 +1396,7 @@ async def list_command(interaction: discord.Interaction, *, title: str, header: 
 
     async def fetch_rows(cur: str):
         its, nxt = await fetch(cur)
+        its = await resolve_list_usernames(its) if fmt is user_row else its
         return [fmt(i) for i in its], nxt
 
     pager = CursorPager(interaction.user.id, title, header, rows, cursor, fetch_rows, thumbnail=thumbnail)
