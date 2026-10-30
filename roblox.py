@@ -516,6 +516,55 @@ class RobloxClient:
         return await self._thumb("https://thumbnails.roblox.com/v1/badges/icons", {
             "badgeIds": str(badge_id), "size": "150x150", "format": "Png", "isCircular": "false"})
 
+    # ---------- bulk lookups, limiteds, servers, big thumbnails ----------
+
+    async def users_by_ids(self, ids: list[int]) -> dict[int, dict]:
+        """{id: {id, name, displayName, hasVerifiedBadge}}. Banned users are included. Missing IDs are absent."""
+        out: dict[int, dict] = {}
+        for batch in _chunk(list(dict.fromkeys(ids)), 100):
+            d = await self._request("POST", "https://users.roblox.com/v1/users",
+                                    json={"userIds": batch, "excludeBannedUsers": False})
+            for u in d.get("data") or []:
+                out[int(u["id"])] = u
+        return out
+
+    async def users_by_names(self, names: list[str]) -> dict[str, dict]:
+        """{lowercase requested name: {id, name, displayName, ...}}. Unknown names are absent."""
+        out: dict[str, dict] = {}
+        for batch in _chunk(list(dict.fromkeys(n.lower() for n in names)), 100):
+            d = await self._request("POST", "https://users.roblox.com/v1/usernames/users",
+                                    json={"usernames": batch, "excludeBannedUsers": False})
+            for u in d.get("data") or []:
+                out[str(u.get("requestedUsername", u.get("name"))).lower()] = u
+        return out
+
+    async def validate_username(self, name: str) -> dict:
+        """{code, message}. code 0 means the name could be registered right now."""
+        return await self._request("GET", "https://auth.roblox.com/v2/usernames/validate", params={
+            "request.username": name, "request.birthday": "2000-01-01", "request.context": "Signup"})
+
+    async def resale_data(self, asset_id: int) -> Optional[dict]:
+        """Recent average price and supply for a limited. None if the item isn't a limited."""
+        return await self._safe(self._request("GET", f"https://economy.roblox.com/v1/assets/{asset_id}/resale-data"))
+
+    async def server_page(self, place_id: int, cursor: str = "") -> tuple[list[dict], Optional[str]]:
+        return await self._page(f"https://games.roblox.com/v1/games/{place_id}/servers/Public",
+                                cursor=cursor, params={"limit": "100", "sortOrder": "Desc"})
+
+    async def big_thumbnail(self, kind: str, target_id: int) -> Optional[str]:
+        """kind: asset | game | group | user | headshot. Largest size Roblox serves for that kind."""
+        base = "https://thumbnails.roblox.com/v1/"
+        table = {
+            "asset": ("assets", "assetIds", "420x420", {"returnPolicy": "PlaceHolder"}),
+            "game": ("games/icons", "universeIds", "512x512", {}),
+            "group": ("groups/icons", "groupIds", "420x420", {}),
+            "user": ("users/avatar", "userIds", "720x720", {}),
+            "headshot": ("users/avatar-headshot", "userIds", "420x420", {}),
+        }
+        path, key, size, extra = table[kind]
+        return await self._thumb(base + path, {key: str(target_id), "size": size, "format": "Png",
+                                              "isCircular": "false", **extra})
+
     # ---------- search by name ----------
 
     async def search_groups(self, query: str, limit: int = 10) -> list[dict]:

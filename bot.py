@@ -8,12 +8,13 @@
 import asyncio
 import io
 import logging
+import math
 import os
 import re
 import time
 from collections import deque
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 import discord
 from aiohttp import web
@@ -21,6 +22,7 @@ from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
+import alerts
 import audio
 import toolkit
 from roblox import (AuthError, ChallengeRequired, GroupInfo, RobloxClient,
@@ -207,11 +209,14 @@ class DeadAir(discord.Client):
         await self.tree.sync()
         log.info("Commands synced globally")
 
+        await alerts.start()
+
         if not self.status_loop.is_running():
             self.status_loop.start()
 
     async def close(self):
         self.status_loop.cancel()
+        await alerts.stop()
         await toolkit.close()
         if self.rbx:
             await self.rbx.close()
@@ -228,6 +233,14 @@ async def on_app_error(interaction: discord.Interaction, error: app_commands.App
     original = getattr(error, "original", error)
     if isinstance(error, app_commands.CheckFailure):
         return  # the rate limiter already replied
+    if isinstance(getattr(error, "original", error), toolkit.UserError):
+        error = error.original if hasattr(error, "original") else error
+        embed = error_embed(str(error))
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=embed, attachments=[], view=None)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
     if isinstance(original, AuthError):
         embed = error_embed("The bot's Roblox cookie is dead. Replace `ROBLOX_COOKIE` and restart.", "Roblox login failed")
     elif isinstance(original, RobloxError):
@@ -673,9 +686,11 @@ async def explain_no_match(gid: int, everything: list) -> str:
     only_moderated="Only show the moderated ones",
     amount="How many audios to scan: all (default), or a number like 5000 or 5k",
     refresh="Rescan from scratch instead of reusing a scan from the last 5 minutes",
+    export="Also attach every result as a CSV file (id, name, status, link)",
 )
 async def search(interaction: discord.Interaction, group: str, term: str, exact: bool = False,
-                 only_moderated: bool = False, amount: Optional[str] = None, refresh: bool = False):
+                 only_moderated: bool = False, amount: Optional[str] = None, refresh: bool = False,
+                 export: bool = False):
     await interaction.response.defer(thinking=True)
     term = term.strip()
     if not term:
@@ -751,6 +766,14 @@ async def search(interaction: discord.Interaction, group: str, term: str, exact:
     header = (f"{len(matched)} of {len(everything)} audios in {link} (`{gid}`) match "
               f"`{link_text(term, 60)}`.\n{scanned}." + status_note)
     await send_results(interaction, "Audio search", header, rows, only_moderated, icon)
+    if export:
+        exported = [r for r in rows if r["status"] == "broken"] if only_moderated else rows
+        if exported:
+            file, note = toolkit.csv_file(
+                ["asset_id", "name", "status", "link"],
+                [(r["id"], r["name"] or "", LABELS[r["status"]], asset_url(r["id"])) for r in exported],
+                f"audio_search_{gid}.csv")
+            await interaction.followup.send(content=f"Exported {num(len(exported))} results. {note}".strip(), file=file)
 
 
 @bot.tree.command(name="join", description="Make the bot's Roblox account join a group")
@@ -1739,9 +1762,391 @@ for _cmd in (members_cmd, groupgames_cmd, membership_cmd):
     _cmd.autocomplete("group")(group_autocomplete)
 
 
+# ================================================================
+# BULK LOOKUPS, AUDIO DOWNLOAD, LIMITEDS, SERVERS, COMPARE, THUMBNAILS
+# ================================================================
+
+# ---------- /bulkids ----------
+
+BULK_LIMIT = 500
+
+
+def parse_bulk(raw: str) -> list[tuple[str, str]]:
+    """[(kind, value)] in the order given. kind is 'id' or 'name'. Profile links and @names work."""
+    out: list[tuple[str, str]] = []
+    for tok in re.split(r"[\s,;|]+", raw or ""):
+        tok = tok.strip().strip("<>")
+        if not tok:
+            continue
+        m = re.search(r"roblox\.com/(?:[a-z-]+/)?users/(\d+)", tok, re.I)
+        if m:
+            out.append(("id", m.group(1)))
+        elif tok.isdigit():
+            out.append(("id", tok))
+        else:
+            out.append(("name", tok.lstrip("@")))
+    return out
+
+
+@bot.tree.command(name="bulkids", description="Paste many user IDs (or usernames) and get names, display names and IDs back")
+@app_commands.describe(
+    users="IDs or usernames separated by spaces, commas or new lines. Profile links work too",
+    export="Also attach the results as a CSV file",
+)
+async def bulkids_cmd(interaction: discord.Interaction, users: str, export: bool = False):
+    await interaction.response.defer(thinking=True)
+    items = parse_bulk(users)
+    if not items:
+        await show(interaction, error_embed("Paste at least one user ID or username.", "Nothing to look up"))
+        return
+    cut = len(items) > BULK_LIMIT
+    items = items[:BULK_LIMIT]
+    rbx = bot.rbx
+    ids = [int(v) for k, v in items if k == "id"]
+    names = [v for k, v in items if k == "name"]
+    by_id = await rbx.users_by_ids(ids) if ids else {}
+    by_name = await rbx.users_by_names(names) if names else {}
+
+    lines, table, missing = [], [], 0
+    for kind, value in items:
+        u = by_id.get(int(value)) if kind == "id" else by_name.get(value.lower())
+        if not u:
+            missing += 1
+            lines.append(f"`{link_text(value, 30)}`  not found")
+            table.append((value, "", "", "not found"))
+            continue
+        uid, uname, disp = u["id"], u.get("name") or "", u.get("displayName") or ""
+        label = f"[{esc(link_text(uname, 30))}]({profile_url(uid)})"
+        shown = f"  display name **{esc(link_text(disp, 30))}**" if disp and disp != uname else ""
+        lines.append(f"{label}{shown}  `{uid}`")
+        table.append((uid, uname, disp, "found"))
+
+    found = len(items) - missing
+    header = f"{found} of {len(items)} found."
+    if cut:
+        header += f" Only the first {BULK_LIMIT} were looked up."
+    pager = Pager(interaction.user.id, "Bulk lookup", header, lines, f"{len(lines)} entries", COLORS["base"])
+    pager.message = await show(interaction, pager.embed(), view=pager)
+    if export:
+        file, note = toolkit.csv_file(["id", "username", "display_name", "result"], table, "bulk_lookup.csv")
+        await interaction.followup.send(content=f"Exported {len(table)} rows. {note}".strip(), file=file)
+
+
+# ---------- /audiograb ----------
+
+def sniff_audio(data: bytes) -> str:
+    if data[:4] == b"OggS":
+        return "ogg"
+    if data[:4] == b"RIFF":
+        return "wav"
+    if data[:4] == b"fLaC":
+        return "flac"
+    if data[:3] == b"ID3" or (len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0):
+        return "mp3"
+    return "bin"
+
+
+@bot.tree.command(name="audiograb", description="Download a Roblox audio as a file (only works if the bot's account can access it)")
+@app_commands.describe(asset_id="Audio asset ID or a create.roblox.com link")
+async def audiograb_cmd(interaction: discord.Interaction, asset_id: str):
+    await interaction.response.defer(thinking=True)
+    aid = parse_id(asset_id, "audio ID")
+    dev, data, err = await probe_asset(aid)
+    if dev and dev.get("isModerated"):
+        await show(interaction, error_embed("That audio is moderated, so Roblox won't hand out the file.", "Can't download"))
+        return
+    if not data:
+        await show(interaction, error_embed(
+            f"Roblox wouldn't give the bot that file{f' ({err})' if err else ''}. The account probably lacks "
+            "permission, since Roblox only serves audio to accounts that are allowed to use it.", "Can't download"))
+        return
+    kind = sniff_audio(data)
+    name = f"{re.sub(r'[^A-Za-z0-9_-]+', '_', (dev or {}).get('name') or 'audio')[:40]}_{aid}.{kind}"
+    if len(data) > toolkit.CFG["MaxOutputBytes"]:
+        await show(interaction, error_embed(f"The file is {toolkit.human_size(len(data))}, over Discord's upload limit.",
+                                            "Too big to send"))
+        return
+    e = make_embed(link_text((dev or {}).get("name") or f"Audio {aid}", 200),
+                   f"{kind.upper()}, {toolkit.human_size(len(data))}", )
+    e.url = asset_url(aid)
+    await show(interaction, e, file=discord.File(io.BytesIO(data), filename=name))
+
+
+# ---------- /limited ----------
+
+ROLI_DEMAND = {0: "Terrible", 1: "Low", 2: "Normal", 3: "High", 4: "Amazing"}
+ROLI_TREND = {0: "Lowering", 1: "Unstable", 2: "Stable", 3: "Raising", 4: "Fluctuating"}
+_roli: dict = {"at": 0.0, "items": {}}
+
+
+async def rolimons_items() -> dict:
+    """Rolimons asks for at most one request a minute, so the whole list is cached for 10 minutes."""
+    if time.monotonic() - _roli["at"] > 600 or not _roli["items"]:
+        data = await toolkit.http_json("https://www.rolimons.com/itemapi/itemdetails")
+        items = (data or {}).get("items")
+        if not items:
+            raise toolkit.UserError("Rolimons didn't return its item list.")
+        _roli.update(at=time.monotonic(), items=items)
+    return _roli["items"]
+
+
+def roli_find(items: dict, query: str) -> tuple[Optional[str], int]:
+    """(item id, number of other matches). Accepts an ID, an acronym, an exact name, or part of a name."""
+    q = query.strip().lower()
+    if q.isdigit() and q in items:
+        return q, 0
+    exact = [i for i, v in items.items() if q in (str(v[0]).lower(), str(v[1]).lower())]
+    pool = exact or [i for i, v in items.items() if q in str(v[0]).lower()]
+    if not pool:
+        return None, 0
+    pool.sort(key=lambda i: items[i][2] or 0, reverse=True)
+    return pool[0], len(pool) - 1
+
+
+@bot.tree.command(name="limited", description="Price, RAP, value and demand for a limited item")
+@app_commands.describe(item="Item name, acronym (like DAF), catalog link, or asset ID")
+async def limited_cmd(interaction: discord.Interaction, item: str):
+    await interaction.response.defer(thinking=True)
+    q = item.strip()
+    m = re.search(r"(?:catalog|bundles|library)/(\d+)", q)
+    q = m.group(1) if m else q
+    roli = None
+    try:
+        items = await rolimons_items()
+        iid, others = roli_find(items, q)
+        roli = (iid, items[iid], others) if iid else None
+    except toolkit.UserError:
+        iid = q if q.isdigit() else None   # Rolimons is down: Roblox's own data still works for an ID
+        if not iid:
+            raise
+    if not iid:
+        await show(interaction, not_found("Limited", f"No limited matched `{link_text(q, 60)}`."))
+        return
+    aid = int(iid)
+    resale, econ, thumb = await asyncio.gather(
+        bot.rbx.resale_data(aid), bot.rbx.economy_details(aid), bot.rbx.asset_thumbnail(aid))
+    name = (roli[1][0] if roli else None) or (econ or {}).get("Name") or f"Item {aid}"
+    e = make_embed(link_text(name, 200))
+    e.url = f"https://www.rolimons.com/item/{aid}"
+    if roli:
+        v = roli[1]
+        e.add_field(name="RAP", value=num(v[2]))
+        e.add_field(name="Value", value=num(v[3]) if v[3] != -1 else "Not valued")
+        e.add_field(name="Demand", value=ROLI_DEMAND.get(v[5], "Unassigned"))
+        e.add_field(name="Trend", value=ROLI_TREND.get(v[6], "Unassigned"))
+        flags = [n for n, on in (("Projected", v[7] == 1), ("Hyped", v[8] == 1), ("Rare", v[9] == 1)) if on]
+        e.add_field(name="Flags", value=", ".join(flags) or "None")
+        if v[1]:
+            e.add_field(name="Acronym", value=v[1])
+    if resale:
+        e.add_field(name="Roblox RAP", value=num(resale.get("recentAveragePrice")))
+        e.add_field(name="Original price", value=num(resale.get("originalPrice")) if resale.get("originalPrice") else "n/a")
+        if resale.get("assetStock"):
+            e.add_field(name="Stock", value=num(resale["assetStock"]))
+        e.add_field(name="Sales", value=num(resale.get("sales")))
+    e.add_field(name="Links", value=f"[Catalog](https://www.roblox.com/catalog/{aid})  |  "
+                                    f"[Rolimons](https://www.rolimons.com/item/{aid})", inline=False)
+    if roli and roli[2]:
+        e.set_footer(text=f"{CFG['Footer']}  |  {roli[2]} other matches, use the asset ID to be exact")
+    if thumb:
+        e.set_thumbnail(url=thumb)
+    await show(interaction, e)
+
+
+# ---------- /usernamecheck ----------
+
+@bot.tree.command(name="usernamecheck", description="Is a Roblox username free, taken or not allowed?")
+@app_commands.describe(username="The username to check")
+async def usernamecheck_cmd(interaction: discord.Interaction, username: str):
+    await interaction.response.defer(thinking=True)
+    name = username.strip().lstrip("@")
+    if not name:
+        await show(interaction, error_embed("Give a username to check.", "Empty username"))
+        return
+    res, owner = await asyncio.gather(bot.rbx.validate_username(name), bot.rbx.users_by_names([name]))
+    code, message = res.get("code"), res.get("message") or "No message from Roblox."
+    holder = owner.get(name.lower())
+    if code == 0 and not holder:
+        e = make_embed("Available", f"`{link_text(name, 30)}` is free and valid right now.")
+    elif holder:
+        e = make_embed("Taken", f"`{link_text(name, 30)}` belongs to [{esc(link_text(holder.get('name'), 30))}]"
+                                f"({profile_url(holder['id'])}) (`{holder['id']}`).", COLORS["bad"])
+    else:
+        e = make_embed("Not allowed", f"`{link_text(name, 30)}` can't be used. Roblox says: {message}", COLORS["bad"])
+    e.set_footer(text=f"{CFG['Footer']}  |  Availability can change at any moment")
+    await show(interaction, e)
+
+
+# ---------- /robux ----------
+
+ROBUX = {
+    "Cut": 0.30,                                             # Roblox's share of marketplace and in-game sales
+    "DevEx": float(os.getenv("DEVEX_RATE", "0.0038")),       # USD per earned Robux, standard rate
+    "DevExMin": 30_000,
+    "Buy": float(os.getenv("ROBUX_BUY_RATE", "0.0125")),     # USD per Robux at the usual store price
+}
+
+
+@bot.tree.command(name="robux", description="Robux calculator: sale cut, DevEx payout and what buying costs")
+@app_commands.describe(amount="Number of Robux (5k and 1.5m work)")
+async def robux_cmd(interaction: discord.Interaction, amount: str):
+    m = re.fullmatch(r"([\d,]*\.?\d+)\s*([kKmM]?)", amount.strip())
+    if not m:
+        await interaction.response.send_message(
+            embed=error_embed("Give a number like `2500`, `5k` or `1.5m`.", "Not a number"), ephemeral=True)
+        return
+    n = float(m.group(1).replace(",", "")) * {"": 1, "k": 1e3, "m": 1e6}[m.group(2).lower()]
+    keep = 1 - ROBUX["Cut"]
+    e = make_embed(f"{n:,.0f} Robux")
+    e.add_field(name="If you sell something for this", value=f"You receive **{n * keep:,.0f}** after Roblox's "
+                f"{ROBUX['Cut']:.0%} cut.", inline=False)
+    e.add_field(name="To receive this after the cut", value=f"Price it at **{math.ceil(n / keep):,}**.", inline=False)
+    payout = n * ROBUX["DevEx"]
+    eligible = "" if n >= ROBUX["DevExMin"] else f" (DevEx needs at least {ROBUX['DevExMin']:,} earned Robux)"
+    e.add_field(name="DevEx value", value=f"**${payout:,.2f}** at ${ROBUX['DevEx']} per earned Robux{eligible}.",
+                inline=False)
+    e.add_field(name="Cost to buy", value=f"About **${n * ROBUX['Buy']:,.2f}** at ${ROBUX['Buy']} per Robux. "
+                "Real prices vary by pack and store.", inline=False)
+    e.set_footer(text=f"{CFG['Footer']}  |  Rates change. Check the Creator Dashboard before cashing out")
+    await interaction.response.send_message(embed=e)
+
+
+# ---------- /compare ----------
+
+def side_table(a_name: str, b_name: str, rows: list[tuple[str, str, str]]) -> str:
+    w = max(len(a_name), len(b_name), *(len(x) for _, x, _ in rows), *(len(y) for _, _, y in rows))
+    w = min(w, 18)
+    label_w = max(len(r[0]) for r in rows)
+
+    def cut(s: str) -> str:
+        return s if len(s) <= w else s[: w - 1] + "."
+
+    head = f"{'':<{label_w}}  {cut(a_name):>{w}}  {cut(b_name):>{w}}"
+    body = [f"{label:<{label_w}}  {cut(x):>{w}}  {cut(y):>{w}}" for label, x, y in rows]
+    return "```\n" + "\n".join([head, *body]) + "\n```"
+
+
+@bot.tree.command(name="compare", description="Compare two Roblox users or two groups side by side")
+@app_commands.describe(kind="Users or groups", first="First user or group", second="Second user or group")
+async def compare_cmd(interaction: discord.Interaction, kind: Literal["user", "group"], first: str, second: str):
+    await interaction.response.defer(thinking=True)
+    rbx = bot.rbx
+    if kind == "user":
+        a, b = await asyncio.gather(rbx.resolve_user(first), rbx.resolve_user(second))
+        if not a or not b:
+            await show(interaction, not_found("User", "I couldn't find one of those users."))
+            return
+
+        async def stats(u: dict):
+            uid = int(u["id"])
+            f, fo, fg, groups = await asyncio.gather(
+                rbx.user_count(uid, "friends"), rbx.user_count(uid, "followers"),
+                rbx.user_count(uid, "followings"), rbx.user_groups(uid))
+            return [num(f), num(fo), num(fg), num(len(groups))]
+
+        sa, sb = await asyncio.gather(stats(a), stats(b))
+        year = lambda u: (u.get("created") or "????")[:10]
+        rows = [("Joined", year(a), year(b)), ("Friends", sa[0], sb[0]), ("Followers", sa[1], sb[1]),
+                ("Following", sa[2], sb[2]), ("Groups", sa[3], sb[3]),
+                ("Verified", "yes" if a.get("hasVerifiedBadge") else "no", "yes" if b.get("hasVerifiedBadge") else "no")]
+        na, nb = a.get("name") or "first", b.get("name") or "second"
+        e = make_embed("User comparison", side_table(na, nb, rows))
+    else:
+        ga, gb = await pick_group(interaction, first, strict=False), None
+        if not ga:
+            return
+        gb = await pick_group(interaction, second, strict=False)
+        if not gb:
+            return
+        da, db = await asyncio.gather(rbx.group_details(ga), rbx.group_details(gb))
+        if not da or not db:
+            await show(interaction, not_found("Group", "I couldn't load one of those groups."))
+            return
+        entry = lambda d: "locked" if d.get("isLocked") else ("open" if d.get("publicEntryAllowed") else "approval")
+        rows = [("Members", num(da.get("memberCount")), num(db.get("memberCount"))),
+                ("Created", (da.get("created") or "????")[:10], (db.get("created") or "????")[:10]),
+                ("Joining", entry(da), entry(db)),
+                ("Verified", "yes" if da.get("hasVerifiedBadge") else "no", "yes" if db.get("hasVerifiedBadge") else "no")]
+        e = make_embed("Group comparison", side_table(da.get("name") or "first", db.get("name") or "second", rows))
+    await show(interaction, e)
+
+
+# ---------- /servers ----------
+
+@bot.tree.command(name="servers", description="Players online and how full a game's servers are right now")
+@app_commands.describe(game="Game name, place ID, or a roblox.com/games link")
+async def servers_cmd(interaction: discord.Interaction, game: str):
+    await interaction.response.defer(thinking=True)
+    universe = await pick_game(interaction, game)
+    if not universe:
+        return
+    rbx = bot.rbx
+    d, icon = await asyncio.gather(rbx.game_details(universe), rbx.game_icon(universe))
+    if not d:
+        await show(interaction, not_found("Game", f"No game was found for `{link_text(game, 60)}`."))
+        return
+    place = d.get("rootPlaceId")
+    e = make_embed(link_text(d.get("name"), 200))
+    e.url = f"https://www.roblox.com/games/{place}"
+    e.add_field(name="Playing now", value=num(d.get("playing")))
+    e.add_field(name="Max per server", value=num(d.get("maxPlayers")))
+    try:
+        servers, _ = await rbx.server_page(int(place))
+    except RobloxError:
+        servers = []
+    if servers:
+        sizes = [s.get("playing") or 0 for s in servers]
+        cap = servers[0].get("maxPlayers") or d.get("maxPlayers") or 1
+        e.add_field(name="Servers sampled", value=f"{len(servers)} (the {len(servers)} fullest)")
+        e.add_field(name="Average fill", value=f"{sum(sizes) / len(sizes):.1f} of {cap}")
+        e.add_field(name="Fullest", value=f"{max(sizes)} of {cap}")
+        e.add_field(name="Emptiest sampled", value=f"{min(sizes)} of {cap}")
+        e.add_field(name="Servers with room", value=num(sum(1 for s in sizes if s < cap)))
+    else:
+        e.add_field(name="Servers", value="Roblox didn't return a server list for this game.", inline=False)
+    if icon:
+        e.set_thumbnail(url=icon)
+    await show(interaction, e)
+
+
+# ---------- /thumbnail ----------
+
+@bot.tree.command(name="thumbnail", description="Full-size thumbnail of a Roblox asset, game, group or user")
+@app_commands.describe(kind="What kind of thing", target="Name, ID or link of it")
+async def thumbnail_cmd(interaction: discord.Interaction, kind: Literal["asset", "game", "group", "avatar", "headshot"],
+                        target: str):
+    await interaction.response.defer(thinking=True)
+    rbx = bot.rbx
+    label = ""
+    if kind == "game":
+        tid = await pick_game(interaction, target)
+        if not tid:
+            return
+    elif kind == "group":
+        tid = await pick_group(interaction, target, strict=False)
+        if not tid:
+            return
+    elif kind in ("avatar", "headshot"):
+        u = await find_user(interaction, target)
+        if not u:
+            return
+        tid, label = int(u["id"]), u.get("displayName") or u.get("name")
+    else:
+        tid = parse_id(target, "asset ID")
+    url = await rbx.big_thumbnail({"avatar": "user"}.get(kind, kind), tid)
+    if not url:
+        await show(interaction, error_embed("Roblox has no finished image for that yet. Try again in a few seconds.",
+                                            "No thumbnail"))
+        return
+    e = make_embed(f"{kind.title()} thumbnail", f"{link_text(str(label), 100) + '  ' if label else ''}`{tid}`\n[Open full size]({url})")
+    e.set_image(url=url)
+    await show(interaction, e)
+
+
 # ---------- converters, social lookups, utilities (toolkit.py) ----------
 
 toolkit.register(bot)
+alerts.register(bot)
 
 
 # ---------- help ----------
@@ -1764,15 +2169,26 @@ async def help_cmd(interaction: discord.Interaction):
     e.add_field(name="Games and items", value=(
         "`/game` game card\n`/gamepasses` `/gamebadges` passes and badges for a game\n"
         "`/asset` any asset by ID\n`/badge` badge by ID"), inline=False)
+    e.add_field(name="Roblox extras", value=(
+        "`/bulkids` many IDs or usernames to names, display names and IDs\n"
+        "`/audiograb` download an audio file\n`/limited` RAP, value, demand\n"
+        "`/usernamecheck` free or taken\n`/compare` two users or groups\n"
+        "`/servers` players and server fill\n`/thumbnail` full-size images\n"
+        "`/robux` sale cut, DevEx and buy cost\n`/robloxstatus` is Roblox up"), inline=False)
+    e.add_field(name="Alerts", value=(
+        "`/watch audio` `/watch group` DM when something changes\n"
+        "`/watch list` `/watch stop` manage them\n"
+        "`/remind add` `/remind list` `/remind cancel` reminders by DM"), inline=False)
     e.add_field(name="Convert", value=(
-        "`/convert` image to png, jpg, webp, gif, ico...\n`/resize` `/compress` image size and file size\n"
-        "`/gifmaker` up to 6 images into an animated GIF\n"
-        "`/audioconvert` mp3, wav, flac, ogg\n`/waveform` loudness stats and waveform for any audio file"), inline=False)
-    e.add_field(name="Socials", value=(
-        "`/youtube` `/tiktok` `/tweet` link lookups\n"
-        "`/embedfix` make TikTok, Instagram, X and Reddit links embed properly"), inline=False)
+        "`/convert` `/resize` `/compress` `/filter` `/caption` images\n"
+        "`/gifmaker` images to a GIF, `/gifframes` GIF to frames, `/spritesheet`\n"
+        "`/audioconvert` `/trim` `/waveform` audio\n`/ocr` text from an image"), inline=False)
+    e.add_field(name="Links and lookups", value=(
+        "`/youtube` `/tiktok` `/tweet` `/spotify` `/soundcloud` `/github`\n"
+        "`/embedfix` make social links embed, `/unshorten` where a short link goes"), inline=False)
     e.add_field(name="Tools", value=(
-        "`/robloxstatus` is Roblox up\n`/github` user or repo\n`/weather` `/define` `/qr` `/color`"), inline=False)
+        "`/timestamp` Discord time codes\n`/currency` `/crypto` `/weather` `/define`\n"
+        "`/qr` `/color` `/hash` `/base64`"), inline=False)
     e.add_field(name="Bot", value="`/join` make the bot's account join a group\n`/whoami` which account the bot uses",
                 inline=False)
     await interaction.response.send_message(embed=e, ephemeral=True)

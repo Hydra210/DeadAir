@@ -15,7 +15,8 @@ needs an exact name or an ID, and shows suggestions otherwise.
 |---|---|
 | `/check ids:<one ID>` | Full card: status, length, group (link + ID), dates, loudness stats, waveform image |
 | `/check ids:<several IDs>` | Quick list with name and working/moderated status per ID |
-| `/search group term [exact] [only_moderated] [amount]` | Search a group's audio by part of a name, or exact name. `amount` is `all` (default) or a number like `5000` or `5k`. `refresh` forces a rescan |
+| `/search group term [exact] [only_moderated] [amount] [refresh] [export]` | Search a group's audio by part of a name, or exact name. `amount` is `all` (default) or a number like `5000` or `5k`. `refresh` forces a rescan. `export` true also attaches every result as a CSV (id, name, status, link), zipped automatically if it's big |
+| `/audiograb asset_id` | Downloads the audio file itself, if the bot's account is allowed to get it |
 
 **Users** (username, ID, or profile link)
 
@@ -47,6 +48,31 @@ needs an exact name or an ID, and shows suggestions otherwise.
 | `/gamepasses` / `/gamebadges` | A game's passes with prices, or its badges with award counts |
 | `/asset` / `/badge` | Any asset or badge by ID |
 
+
+**More Roblox**
+
+| Command | What it does |
+|---|---|
+| `/bulkids users [export]` | Paste many user IDs and/or usernames (spaces, commas or new lines, profile links work). Returns username, display name and ID for each, up to 500, paged. `export` true adds a CSV |
+| `/limited item` | RAP, value, demand, trend and flags from Rolimons plus Roblox's own resale data. Name, acronym, link or ID |
+| `/usernamecheck` | Free, taken, or not allowed |
+| `/compare kind first second` | Two users or two groups side by side |
+| `/servers game` | Players online and how full the servers are (samples the 100 fullest) |
+| `/thumbnail kind target` | Full-size image of an asset, game, group, avatar or headshot |
+| `/robux amount` | Sale cut, DevEx payout and buy cost. Rates are in `ROBUX` at the top of that section of `bot.py`, or `DEVEX_RATE` / `ROBUX_BUY_RATE` env vars |
+
+**Alerts** (sent by DM, with the channel as a fallback)
+
+| Command | What it does |
+|---|---|
+| `/watch audio` / `/watch group` | DM when an audio turns moderated or works again, or when a group's member count moves by `min_change`. Checked every 10 minutes |
+| `/watch list` / `/watch stop` | See and remove what you watch. 15 per person |
+| `/remind add when message [timezone]` | `in 2h30m`, `6:30pm`, `2026-12-25 09:00`. Also `/remind list` and `/remind cancel` |
+
+Alerts and reminders live in a SQLite file (`DATA_DIR`, default `./data`). Render's free plan wipes the disk on
+every restart or redeploy, so on Render they are lost until you attach a persistent disk and point `DATA_DIR` at it.
+Alerts arrive as a DM from the bot, so test with `/remind add when:in 1m message:test` first.
+
 **Convert** (attach a file to the command, up to 25 MB)
 
 | Command | What it does |
@@ -55,7 +81,12 @@ needs an exact name or an ID, and shows suggestions otherwise.
 | `/resize file [width] [height] [percent]` | Resize an image, keeps the aspect ratio if you give only one side |
 | `/compress file [target_mb]` | Shrinks an image until it fits the size you want |
 | `/gifmaker image1 ... image6 [delay] [loop]` | Turns 2 to 6 images into an animated GIF |
+| `/filter file effect [strength]` | grayscale, invert, sepia, blur, sharpen, pixelate, mirror, flip, rotate. GIFs keep animating |
+| `/caption file text` | Meme text. `top \| bottom` puts text on both |
+| `/gifframes file [mode] [columns]` | Splits a GIF into one sprite sheet or a zip of frames. `/spritesheet` packs 2 to 6 images into a sheet |
+| `/ocr file [language]` | Reads text from an image (needs `OCR_SPACE_KEY`) |
 | `/audioconvert file format` | Audio between mp3, wav, flac and ogg |
+| `/trim file [start] [end]` | Cuts audio, like `0:12.5` to `1:03` |
 | `/waveform file` | Length, peak, average loudness and the same black-and-white waveform `/check` makes, for any audio file |
 
 **Socials and lookups**
@@ -66,12 +97,21 @@ needs an exact name or an ID, and shows suggestions otherwise.
 | `/tiktok link` | Title, creator and thumbnail |
 | `/tweet link` | Post text, author, likes, reposts, views and the first image |
 | `/embedfix link` | Rewrites TikTok, Instagram, X and Reddit links to a host that makes Discord show the real embed |
+| `/spotify link` / `/soundcloud link` | Track, album, artist or playlist info. Spotify gets richer with `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` |
+| `/unshorten link` | Follows a short link and shows every redirect. Refuses private and local addresses |
 | `/robloxstatus` | Whether Roblox is up, with any open incidents |
 | `/github target` | A user or `owner/repo`. `GITHUB_TOKEN` (optional) lifts the 60 per hour limit |
 | `/weather` `/define` `/qr` `/color` | Weather for a city, dictionary definition, QR code, color swatch |
+| `/timestamp when [timezone]` | Discord `<t:...>` codes in every style, ready to copy |
+| `/currency` / `/crypto` | Money conversion (ECB rates) and coin prices (CoinGecko) |
+| `/hash` / `/base64` | Hashes of text or a file, Base64 encode and decode |
 
 Instagram has no public lookup that works without a login, so `/embedfix` is how Instagram links are handled.
-All of this lives in `toolkit.py`. To add a command, write it there and add it to the `COMMANDS` list.
+Converters, lookups and utilities live in `toolkit.py` (add a command there and put it in `COMMANDS`). Reminders and
+watches live in `alerts.py`. Roblox commands stay in `bot.py`.
+
+Optional environment variables: `YOUTUBE_API_KEY`, `GITHUB_TOKEN`, `OCR_SPACE_KEY`, `SPOTIFY_CLIENT_ID`,
+`SPOTIFY_CLIENT_SECRET`, `DATA_DIR`, `DEVEX_RATE`, `ROBUX_BUY_RATE`.
 
 **Bot:** `/join group`, `/whoami`, `/help`.
 

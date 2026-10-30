@@ -5,3 +5,4 @@ soundfile>=0.12.1
 numpy>=1.26
 pillow>=10.1
 qrcode>=7.4
+tzdata>=2024.1

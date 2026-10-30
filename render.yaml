@@ -22,3 +22,11 @@ services:
         sync: false
       - key: GITHUB_TOKEN      # optional, raises the /github rate limit
         sync: false
+      - key: OCR_SPACE_KEY     # optional, enables /ocr
+        sync: false
+      - key: SPOTIFY_CLIENT_ID
+        sync: false
+      - key: SPOTIFY_CLIENT_SECRET
+        sync: false
+      - key: DATA_DIR          # point at a persistent disk to keep /watch and /remind across restarts
+        value: data

@@ -5,12 +5,21 @@
 # bot.py calls register(bot) once. Nothing in here needs a Roblox cookie.
 
 import asyncio
+import base64
 import colorsys
+import csv
 import functools
+import hashlib
 import io
+import ipaddress
 import math
 import os
 import re
+import socket
+import time
+import zipfile
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Awaitable, Callable, Literal, Optional
 from urllib.parse import quote, urlparse
 
@@ -19,7 +28,7 @@ import discord
 import qrcode
 import soundfile as sf
 from discord import app_commands
-from PIL import Image, ImageDraw, ImageSequence, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageSequence, UnidentifiedImageError
 
 import audio
 
@@ -41,6 +50,10 @@ CFG = {
     "HttpTimeout": 12,
     "UserAgent": "DeadAir/1.0 (Discord bot; EXE Development)",
     "Workers": 2,                       # how many heavy conversions may run at once
+    "OcrKey": os.getenv("OCR_SPACE_KEY", ""),            # free key from ocr.space, needed for /ocr
+    "SpotifyId": os.getenv("SPOTIFY_CLIENT_ID", ""),     # optional, richer /spotify
+    "SpotifySecret": os.getenv("SPOTIFY_CLIENT_SECRET", ""),
+    "UnshortenHops": 10,
 }
 
 COLOR = {"base": 0xF2F2F2, "bad": 0xE5484D}
@@ -739,6 +752,683 @@ async def color_cmd(interaction: discord.Interaction, hex: str):
 
 
 # ================================================================
+# CSV EXPORT (used by /search and /bulkids in bot.py)
+# ================================================================
+
+def _safe_cell(v):
+    """Spreadsheets run cells that start with = + - @ as formulas, and audio names are user-made text."""
+    return "'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+
+
+def _zip_bytes(name: str, data: bytes) -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(name, data)
+    return out.getvalue()
+
+
+def csv_file(header: list[str], rows, filename: str) -> tuple[discord.File, str]:
+    """Returns (file, note). Zips the CSV when it is too big, and trims rows only as a last resort."""
+    rows = [[_safe_cell(c) for c in r] for r in rows]
+
+    def build(rs) -> bytes:
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(header)
+        w.writerows(rs)
+        return buf.getvalue().encode("utf-8-sig")   # BOM so Excel reads names with accents correctly
+
+    cap = CFG["MaxOutputBytes"]
+    data = build(rows)
+    if len(data) <= cap:
+        return discord.File(io.BytesIO(data), filename=filename), ""
+    zname = filename.rsplit(".", 1)[0] + ".zip"
+    packed = _zip_bytes(filename, data)
+    if len(packed) <= cap:
+        return discord.File(io.BytesIO(packed), filename=zname), "Zipped because the CSV was large."
+    keep = max(1, int(len(rows) * cap / len(packed) * 0.8))
+    packed = _zip_bytes(filename, build(rows[:keep]))
+    return (discord.File(io.BytesIO(packed), filename=zname),
+            f"Zipped, and only the first {keep:,} of {len(rows):,} rows fit under Discord's size limit.")
+
+
+# ================================================================
+# MORE IMAGE TOOLS
+# ================================================================
+
+def input_format(att: discord.Attachment) -> str:
+    ext = (att.filename.rsplit(".", 1)[-1] or "png").lower()
+    ext = {"jpeg": "jpg", "tif": "tiff"}.get(ext, ext)
+    return ext if ext in IMAGE_FORMATS else "png"
+
+
+def transform_image(data: bytes, fmt: str, fn: Callable[[Image.Image], Image.Image]) -> bytes:
+    img = open_image(data)
+    frames, delays = read_frames(img, fmt in ANIMATED_OK)
+    return write_image([fn(f) for f in frames], delays, fmt)
+
+
+EFFECTS = ["grayscale", "invert", "sepia", "blur", "sharpen", "pixelate", "mirror", "flip",
+           "rotate90", "rotate180", "rotate270"]
+
+
+def apply_effect(img: Image.Image, effect: str, strength: int) -> Image.Image:
+    rgba = img.convert("RGBA")
+    r, g, b, a = rgba.split()
+    rgb = Image.merge("RGB", (r, g, b))
+    if effect == "grayscale":
+        out = ImageOps.grayscale(rgb).convert("RGB")
+    elif effect == "invert":
+        out = ImageOps.invert(rgb)
+    elif effect == "sepia":
+        gray = ImageOps.grayscale(rgb)
+        out = ImageOps.colorize(gray, black=(30, 18, 8), white=(255, 240, 214), mid=(160, 110, 66))
+    elif effect == "blur":
+        out = rgb.filter(ImageFilter.GaussianBlur(radius=strength * max(rgba.size) / 400))
+    elif effect == "sharpen":
+        out = rgb.filter(ImageFilter.UnsharpMask(radius=2, percent=50 + strength * 40, threshold=2))
+    elif effect == "pixelate":
+        block = max(2, max(rgba.size) * strength // 200)
+        small = rgb.resize((max(1, rgba.width // block), max(1, rgba.height // block)), Image.BILINEAR)
+        out = small.resize(rgba.size, Image.NEAREST)
+    elif effect == "mirror":
+        return ImageOps.mirror(rgba)
+    elif effect == "flip":
+        return ImageOps.flip(rgba)
+    else:
+        angle = {"rotate90": Image.ROTATE_90, "rotate180": Image.ROTATE_180, "rotate270": Image.ROTATE_270}[effect]
+        return rgba.transpose(angle)
+    out = out.convert("RGBA")
+    out.putalpha(a)
+    return out
+
+
+def wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_w: int) -> list[str]:
+    lines, line = [], ""
+    for word in text.split():
+        trial = f"{line} {word}".strip()
+        if draw.textlength(trial, font=font) <= max_w or not line:
+            line = trial
+        else:
+            lines.append(line)
+            line = word
+    return lines + [line] if line else lines
+
+
+def draw_caption(img: Image.Image, top: str, bottom: str) -> Image.Image:
+    img = img.convert("RGBA")
+    draw = ImageDraw.Draw(img)
+    size = max(18, img.width // 10)
+    font = ImageFont.load_default(size)
+    stroke = max(2, size // 12)
+    margin = max(6, img.height // 40)
+
+    def block(text: str, from_top: bool):
+        lines = wrap_text(draw, text.upper(), font, img.width - 2 * margin)
+        height = len(lines) * int(size * 1.1)
+        y = margin if from_top else img.height - margin - height
+        for ln in lines:
+            w = draw.textlength(ln, font=font)
+            draw.text(((img.width - w) / 2, y), ln, font=font, fill="white", stroke_width=stroke, stroke_fill="black")
+            y += int(size * 1.1)
+
+    if top:
+        block(top, True)
+    if bottom:
+        block(bottom, False)
+    return img
+
+
+def split_frames_to_sheet(frames: list[Image.Image], cols: int, cell: tuple[int, int]) -> Image.Image:
+    rows = math.ceil(len(frames) / cols)
+    w, h = cell
+    if w * cols * h * rows > CFG["MaxPixels"]:
+        raise UserError("That sheet would be too large. Use `/resize` on the image first or use fewer frames.")
+    sheet = Image.new("RGBA", (w * cols, h * rows), (0, 0, 0, 0))
+    for i, f in enumerate(frames):
+        fit = ImageOps.contain(f.convert("RGBA"), cell, Image.LANCZOS)
+        sheet.paste(fit, ((i % cols) * w + (w - fit.width) // 2, (i // cols) * h + (h - fit.height) // 2))
+    return sheet
+
+
+def png_bytes(img: Image.Image) -> bytes:
+    out = io.BytesIO()
+    img.save(out, "PNG", optimize=True)
+    return out.getvalue()
+
+
+@app_commands.command(name="filter", description="Apply an effect to an image: grayscale, blur, pixelate, rotate...")
+@app_commands.describe(file="The image", effect="What to do to it", strength="1 to 10 for blur, sharpen and pixelate (default 5)")
+@guarded
+async def filter_cmd(interaction: discord.Interaction, file: discord.Attachment,
+                     effect: Literal["grayscale", "invert", "sepia", "blur", "sharpen", "pixelate", "mirror",
+                                     "flip", "rotate90", "rotate180", "rotate270"],
+                     strength: app_commands.Range[int, 1, 10] = 5):
+    data = await read_attachment(file, "image")
+    fmt = input_format(file)
+    out = await heavy(transform_image, data, fmt, lambda f: apply_effect(f, effect, strength))
+    name = f"{stem(file)}_{effect}.{IMAGE_FORMATS[fmt][1]}"
+    e, f = image_result("Filter applied", f"`{effect}` on `{file.filename}`. {human_size(len(out))}.", out, name, fmt)
+    await reply(interaction, e, f)
+
+
+@app_commands.command(name="caption", description="Add meme-style text to an image. Use | to split top and bottom text")
+@app_commands.describe(file="The image", text="Text for the top, or 'top text | bottom text'")
+@guarded
+async def caption_cmd(interaction: discord.Interaction, file: discord.Attachment,
+                      text: app_commands.Range[str, 1, 200]):
+    top, _, bottom = text.partition("|")
+    top, bottom = top.strip(), bottom.strip()
+    data = await read_attachment(file, "image")
+    fmt = input_format(file)
+    out = await heavy(transform_image, data, fmt, lambda f: draw_caption(f, top, bottom))
+    name = f"{stem(file)}_caption.{IMAGE_FORMATS[fmt][1]}"
+    e, f = image_result("Captioned", f"{human_size(len(out))}.", out, name, fmt)
+    await reply(interaction, e, f)
+
+
+@app_commands.command(name="gifframes", description="Split a GIF or animated WebP into a sprite sheet or a zip of frames")
+@app_commands.describe(file="The animated image", mode="One sheet image, or a zip with every frame",
+                       columns="Columns for the sheet (default: square-ish)")
+@guarded
+async def gifframes_cmd(interaction: discord.Interaction, file: discord.Attachment,
+                        mode: Literal["sheet", "zip"] = "sheet",
+                        columns: Optional[app_commands.Range[int, 1, 30]] = None):
+    data = await read_attachment(file, "image")
+
+    def work():
+        img = open_image(data)
+        frames, _ = read_frames(img, True)
+        if mode == "zip":
+            out = io.BytesIO()
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as z:
+                for i, f in enumerate(frames):
+                    z.writestr(f"frame_{i + 1:03d}.png", png_bytes(f))
+            return out.getvalue(), len(frames), "zip"
+        cols = columns or math.ceil(math.sqrt(len(frames)))
+        return png_bytes(split_frames_to_sheet(frames, cols, frames[0].size)), len(frames), "png"
+
+    out, count, ext = await heavy(work)
+    name = f"{stem(file)}_frames.{ext}"
+    e = embed("Frames extracted", f"{count} frames from `{file.filename}`. {human_size(len(out))}.")
+    if ext == "png":
+        e.set_image(url=f"attachment://{name}")
+    await reply(interaction, e, out_file(out, name))
+
+
+@app_commands.command(name="spritesheet", description="Pack 2 to 6 images into one sprite sheet")
+@app_commands.describe(image1="First image", image2="Second image", image3="Third", image4="Fourth", image5="Fifth",
+                       image6="Sixth", columns="Columns (default: all in one row up to 3, then a grid)")
+@guarded
+async def spritesheet_cmd(interaction: discord.Interaction, image1: discord.Attachment,
+                          image2: Optional[discord.Attachment] = None, image3: Optional[discord.Attachment] = None,
+                          image4: Optional[discord.Attachment] = None, image5: Optional[discord.Attachment] = None,
+                          image6: Optional[discord.Attachment] = None,
+                          columns: Optional[app_commands.Range[int, 1, 6]] = None):
+    picked = [a for a in (image1, image2, image3, image4, image5, image6) if a]
+    if len(picked) < 2:
+        raise UserError("A sheet needs at least two images.")
+    datas = [await read_attachment(a, "image") for a in picked]
+
+    def work():
+        frames = []
+        for raw in datas:
+            im = open_image(raw)
+            im.seek(0)
+            frames.append(im.convert("RGBA"))
+        cell = frames[0].size
+        cols = columns or (len(frames) if len(frames) <= 3 else math.ceil(len(frames) / 2))
+        return png_bytes(split_frames_to_sheet(frames, cols, cell))
+
+    out = await heavy(work)
+    e, f = image_result("Sprite sheet", f"{len(picked)} images, each fitted to the size of the first. "
+                                        f"{human_size(len(out))}.", out, "spritesheet.png", "png")
+    await reply(interaction, e, f)
+
+
+@app_commands.command(name="ocr", description="Read the text out of a screenshot or photo")
+@app_commands.describe(file="The image", language="Language of the text (default English)")
+@guarded
+async def ocr_cmd(interaction: discord.Interaction, file: discord.Attachment,
+                  language: Literal["eng", "spa", "fre", "ger", "por", "ita", "rus", "jpn", "kor", "chs"] = "eng"):
+    if not CFG["OcrKey"]:
+        raise UserError("`/ocr` needs a free key from ocr.space. Set it as `OCR_SPACE_KEY` on the bot.")
+    data = await read_attachment(file, "image")
+    small, _, _ = await heavy(compress_image, data, 950_000)   # the free plan only takes files under 1 MB
+    form = aiohttp.FormData()
+    form.add_field("apikey", CFG["OcrKey"])
+    form.add_field("language", language)
+    form.add_field("OCREngine", "2")
+    form.add_field("file", small, filename="image.jpg", content_type="image/jpeg")
+    try:
+        s = await get_session()
+        async with s.post("https://api.ocr.space/parse/image", data=form,
+                          timeout=aiohttp.ClientTimeout(total=40)) as r:
+            res = await r.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise UserError("Couldn't reach the OCR service.")
+    if res.get("IsErroredOnProcessing"):
+        raise UserError(clip(str(res.get("ErrorMessage") or "The OCR service couldn't read that image."), 300))
+    text = "\n".join(p.get("ParsedText", "") for p in res.get("ParsedResults") or []).strip()
+    if not text:
+        raise UserError("No text was found in that image.")
+    if len(text) <= 3900:
+        await reply(interaction, embed("Text found", f"```\n{text}\n```"))
+    else:
+        await reply(interaction, embed("Text found", f"{len(text):,} characters, attached as a file."),
+                    discord.File(io.BytesIO(text.encode()), filename="ocr.txt"))
+
+
+# ================================================================
+# AUDIO TRIM
+# ================================================================
+
+def parse_clock(raw: str) -> float:
+    """'83', '1:23', '1:23.5' or '1:02:03' to seconds."""
+    parts = raw.strip().split(":")
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError:
+        raise UserError(f"`{clip(raw, 20)}` isn't a time. Use seconds or mm:ss, like `83` or `1:23.5`.")
+    if not 1 <= len(nums) <= 3 or any(n < 0 for n in nums):
+        raise UserError("Use seconds or mm:ss, like `83` or `1:23.5`.")
+    total = 0.0
+    for n in nums:
+        total = total * 60 + n
+    return total
+
+
+CONTAINER_TO_EXT = {v[0]: k for k, v in AUDIO_FORMATS.items()}
+
+
+def trim_audio(data: bytes, start: float, end: Optional[float]) -> tuple[bytes, str, float]:
+    try:
+        with sf.SoundFile(io.BytesIO(data)) as src:
+            sr = src.samplerate
+            total = src.frames / sr
+            if total > CFG["MaxAudioSeconds"]:
+                raise UserError(f"That audio is longer than {CFG['MaxAudioSeconds'] // 60} minutes.")
+            stop = min(end, total) if end is not None else total
+            if start >= stop:
+                raise UserError(f"The start has to be before the end. The file is {fmt_duration(total)} long.")
+            ext = CONTAINER_TO_EXT.get(src.format, "wav")
+            container, subtype = AUDIO_FORMATS[ext]
+            kwargs = {"subtype": subtype} if subtype else {}
+            out = io.BytesIO()
+            src.seek(int(start * sr))
+            left = int((stop - start) * sr)
+            with sf.SoundFile(out, "w", samplerate=sr, channels=src.channels, format=container, **kwargs) as dst:
+                while left > 0:
+                    block = src.read(min(65536, left), dtype="float32", always_2d=True)
+                    if len(block) == 0:
+                        break
+                    dst.write(block)
+                    left -= len(block)
+    except sf.LibsndfileError:
+        raise UserError("I can't read that audio. Supported inputs: mp3, wav, flac, ogg.")
+    return out.getvalue(), ext, stop - start
+
+
+@app_commands.command(name="trim", description="Cut an audio file to a start and end time")
+@app_commands.describe(file="mp3, wav, flac or ogg", start="Where to start, like 12 or 0:12.5",
+                       end="Where to stop (default: the end)")
+@guarded
+async def trim_cmd(interaction: discord.Interaction, file: discord.Attachment, start: str = "0",
+                   end: Optional[str] = None):
+    data = await read_attachment(file, "audio")
+    out, ext, seconds = await heavy(trim_audio, data, parse_clock(start), parse_clock(end) if end else None)
+    e = embed("Audio trimmed", f"{fmt_duration(seconds)} kept from `{file.filename}`. {human_size(len(out))}.")
+    await reply(interaction, e, out_file(out, f"{stem(file)}_trim.{ext}"))
+
+
+# ================================================================
+# TIME: /timestamp
+# ================================================================
+
+_UNIT_WORDS = [(r"weeks?", "w"), (r"days?", "d"), (r"hours?|hrs?", "h"), (r"minutes?|mins?", "m"),
+               (r"seconds?|secs?", "s")]
+_REL = re.compile(r"(\d+(?:\.\d+)?)([wdhms])")
+_UNIT_SECONDS = {"w": 604800, "d": 86400, "h": 3600, "m": 60, "s": 1}
+_ABS = re.compile(r"^(?:(\d{4})-(\d{1,2})-(\d{1,2}))?[ t]*"
+                  r"(?:(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?|(\d{1,2})\s*(am|pm))?$")
+
+
+def parse_tz(name: str):
+    raw = (name or "UTC").strip()
+    low = raw.lower().replace(" ", "")
+    if low in ("utc", "gmt", "z"):
+        return timezone.utc
+    m = re.fullmatch(r"(?:utc|gmt)?([+-])(\d{1,2})(?::?(\d{2}))?", low)
+    if m:
+        delta = timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0))
+        return timezone(delta if m.group(1) == "+" else -delta)
+    for candidate in (raw, "/".join(p.title() for p in raw.replace(" ", "_").split("/"))):
+        try:
+            return ZoneInfo(candidate)
+        except Exception:
+            continue
+    raise UserError(f"I don't know the timezone `{clip(raw, 30)}`. Use a name like `America/New_York` or an offset like `UTC-5`.")
+
+
+def parse_when(text: str, tz) -> datetime:
+    """'in 2h30m', '2026-11-05 18:30', '6:30pm', '2026-12-25'. Relative times ignore the timezone."""
+    t = text.strip().lower().removeprefix("in ").strip()
+    rel = t
+    for pattern, short in _UNIT_WORDS:
+        rel = re.sub(rf"(\d)\s*(?:{pattern})\b", rf"\1{short}", rel)
+    rel = re.sub(r"\band\b|[,\s]", "", rel)
+    if rel and re.fullmatch(r"(?:\d+(?:\.\d+)?[wdhms])+", rel):
+        seconds = sum(float(n) * _UNIT_SECONDS[u] for n, u in _REL.findall(rel))
+        return datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    m = _ABS.match(t)
+    if not m or not any(m.groups()):
+        raise UserError("I couldn't read that time. Try `in 2h30m`, `2026-11-05 18:30`, `6:30pm` or `2026-12-25`.")
+    y, mo, d, hh, mm, ss, ap1, hh2, ap2 = m.groups()
+    now = datetime.now(tz)
+    hour, minute, sec, ap = (int(hh), int(mm), int(ss or 0), ap1) if hh else (int(hh2), 0, 0, ap2) if hh2 else (0, 0, 0, None)
+    if ap:
+        if not 1 <= hour <= 12:
+            raise UserError("Hours with am/pm have to be 1 to 12.")
+        hour = hour % 12 + (12 if ap == "pm" else 0)
+    try:
+        return datetime(int(y) if y else now.year, int(mo) if mo else now.month, int(d) if d else now.day,
+                        hour, minute, sec, tzinfo=tz)
+    except ValueError:
+        raise UserError("That date or time doesn't exist.")
+
+
+@app_commands.command(name="timestamp", description="Make Discord timestamp codes that show in everyone's own timezone")
+@app_commands.describe(when="like 2026-11-05 18:30, 6:30pm, or in 2h30m", timezone="Name like America/New_York, or UTC-5 (default UTC)")
+async def timestamp_cmd(interaction: discord.Interaction, when: str, timezone: str = "UTC"):
+    try:
+        dt = parse_when(when, parse_tz(timezone))
+    except UserError as err:
+        await interaction.response.send_message(embed=error_embed(str(err)), ephemeral=True)
+        return
+    ts = int(dt.timestamp())
+    styles = [("t", "Short time"), ("T", "Long time"), ("d", "Short date"), ("D", "Long date"),
+              ("f", "Short date and time"), ("F", "Full date and time"), ("R", "Relative")]
+    lines = [f"`<t:{ts}:{k}>`  {label}: <t:{ts}:{k}>" for k, label in styles]
+    await interaction.response.send_message(embed=embed("Timestamp", "\n".join(lines)))
+
+
+# ================================================================
+# MONEY: /currency and /crypto
+# ================================================================
+
+def parse_amount(raw: str) -> float:
+    m = re.fullmatch(r"\s*([\d,]*\.?\d+)\s*([kKmM]?)\s*", raw or "")
+    if not m:
+        raise UserError("Give a number like `250`, `1,500`, `5k` or `1.5m`.")
+    return float(m.group(1).replace(",", "")) * {"": 1, "k": 1e3, "m": 1e6}[m.group(2).lower()]
+
+
+@app_commands.command(name="currency", description="Convert money between currencies (daily European Central Bank rates)")
+@app_commands.describe(amount="How much, like 250 or 5k", source="Currency code to convert from, like USD",
+                       target="Currency code to convert to, like EUR")
+@guarded
+async def currency_cmd(interaction: discord.Interaction, amount: str, source: str, target: str):
+    n = parse_amount(amount)
+    a, b = source.strip().upper(), target.strip().upper()
+    if not (re.fullmatch(r"[A-Z]{3}", a) and re.fullmatch(r"[A-Z]{3}", b)):
+        raise UserError("Currencies are three letters, like `USD` or `EUR`.")
+    if a == b:
+        raise UserError("Those are the same currency.")
+    data = await http_json("https://api.frankfurter.dev/v1/latest", params={"base": a, "symbols": b})
+    rate = ((data or {}).get("rates") or {}).get(b)
+    if not rate:
+        raise UserError("One of those currencies isn't supported. The ECB covers about 30 major ones, so "
+                        "things like RUB and crypto aren't included.")
+    e = embed(f"{n:,.2f} {a} = {n * rate:,.2f} {b}", f"1 {a} = {rate:,.4f} {b}")
+    e.set_footer(text=f"{CFG['Footer']}  |  Rates from {data.get('date')}")
+    await reply(interaction, e)
+
+
+def money(v) -> str:
+    if v is None:
+        return "n/a"
+    return f"{v:,.2f}" if abs(v) >= 1 else f"{v:,.6f}".rstrip("0").rstrip(".")
+
+
+@app_commands.command(name="crypto", description="Price, 24h change and market cap for a coin")
+@app_commands.describe(coin="Name or symbol, like bitcoin or eth", currency="Currency code (default usd)")
+@guarded
+async def crypto_cmd(interaction: discord.Interaction, coin: str, currency: str = "usd"):
+    cur = currency.strip().lower()
+    if not re.fullmatch(r"[a-z]{3,5}", cur):
+        raise UserError("Currency should be a code like `usd` or `eur`.")
+    found = await http_json("https://api.coingecko.com/api/v3/search", params={"query": coin.strip()})
+    coins = (found or {}).get("coins") or []
+    if not coins:
+        raise UserError(f"No coin matched `{clip(coin, 40)}`.")
+    rows = await http_json("https://api.coingecko.com/api/v3/coins/markets", params={
+        "vs_currency": cur, "ids": coins[0]["id"], "price_change_percentage": "24h"})
+    if not rows:
+        raise UserError("CoinGecko didn't return prices. It may be rate limiting, or that currency isn't supported.")
+    c = rows[0]
+    change = c.get("price_change_percentage_24h")
+    e = embed(f"{c['name']} ({c['symbol'].upper()})", f"**{money(c['current_price'])} {cur.upper()}**",
+              url=f"https://www.coingecko.com/en/coins/{c['id']}")
+    e.add_field(name="24h change", value=f"{change:+.2f}%" if change is not None else "n/a")
+    e.add_field(name="24h high / low", value=f"{money(c.get('high_24h'))} / {money(c.get('low_24h'))}")
+    e.add_field(name="Market cap", value=f"{money(c.get('market_cap'))}")
+    e.add_field(name="Rank", value=f"#{c['market_cap_rank']}" if c.get("market_cap_rank") else "n/a")
+    if c.get("image"):
+        e.set_thumbnail(url=c["image"])
+    await reply(interaction, e)
+
+
+# ================================================================
+# SMALL DEVELOPER TOOLS: /hash and /base64
+# ================================================================
+
+@app_commands.command(name="hash", description="MD5, SHA-1, SHA-256 and SHA-512 of some text or a file")
+@app_commands.describe(text="Text to hash", file="Or a file to hash instead")
+@guarded
+async def hash_cmd(interaction: discord.Interaction, text: Optional[str] = None,
+                   file: Optional[discord.Attachment] = None):
+    if file:
+        if file.size > CFG["MaxInputBytes"]:
+            raise UserError(f"That file is over {human_size(CFG['MaxInputBytes'])}.")
+        data, what = await file.read(), file.filename
+    elif text is not None:
+        data, what = text.encode(), f"{len(text)} characters of text"
+    else:
+        raise UserError("Give some text or attach a file.")
+    lines = [f"{algo.upper():<7}{hashlib.new(algo, data).hexdigest()}" for algo in ("md5", "sha1", "sha256", "sha512")]
+    await reply(interaction, embed("Hashes", f"{clip(what, 100)}\n```\n" + "\n".join(lines) + "\n```"))
+
+
+@app_commands.command(name="base64", description="Encode text to Base64 or decode it back")
+@app_commands.describe(mode="Encode or decode", text="The text")
+@guarded
+async def base64_cmd(interaction: discord.Interaction, mode: Literal["encode", "decode"],
+                     text: app_commands.Range[str, 1, 4000]):
+    if mode == "encode":
+        result = base64.b64encode(text.encode()).decode()
+    else:
+        try:
+            clean = re.sub(r"\s+", "", text)
+            raw = base64.b64decode(clean + "=" * (-len(clean) % 4), validate=True)
+            result = raw.decode()
+        except UnicodeDecodeError:  # valid Base64 that isn't text
+            await reply(interaction, embed("Decoded", "That decodes to binary data, attached as a file."),
+                        discord.File(io.BytesIO(raw), filename="decoded.bin"))
+            return
+        except Exception:
+            raise UserError("That isn't valid Base64.")
+    if len(result) > 3800:
+        await reply(interaction, embed(mode.title() + "d", "Result attached as a file."),
+                    discord.File(io.BytesIO(result.encode()), filename=f"{mode}d.txt"))
+    else:
+        await reply(interaction, embed(mode.title() + "d", f"```\n{result}\n```"))
+
+
+# ================================================================
+# /unshorten (follows redirects without opening anything on private networks)
+# ================================================================
+
+class SafeResolver(aiohttp.abc.AbstractResolver):
+    """Refuses to connect to private, loopback or otherwise non-public addresses (SSRF protection).
+    Checking here, at connect time, also defeats DNS tricks where a name flips to 127.0.0.1 after a check."""
+
+    def __init__(self):
+        self._inner = aiohttp.ThreadedResolver()
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        found = await self._inner.resolve(host, port, family)
+        safe = [r for r in found if ipaddress.ip_address(r["host"]).is_global]
+        if not safe:
+            raise OSError("blocked: that address isn't public")
+        return safe
+
+    async def close(self):
+        await self._inner.close()
+
+
+def check_public_url(url: str) -> None:
+    p = urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise UserError("Only http and https links can be followed.")
+    if p.port not in (None, 80, 443):
+        raise UserError("I only follow links on the normal web ports.")
+    try:
+        if not ipaddress.ip_address(p.hostname).is_global:
+            raise UserError("That link points at a private address, so I won't open it.")
+    except ValueError:
+        pass   # a name, not an IP literal: SafeResolver checks it when connecting
+
+
+@app_commands.command(name="unshorten", description="Follow a short link and show where it really goes")
+@app_commands.describe(link="The shortened link")
+@guarded
+async def unshorten_cmd(interaction: discord.Interaction, link: str):
+    url = need_url(link)
+    chain: list[tuple[int, str]] = []
+    connector = aiohttp.TCPConnector(resolver=SafeResolver(), use_dns_cache=False)
+    async with aiohttp.ClientSession(connector=connector, headers={"User-Agent": CFG["UserAgent"]},
+                                     timeout=aiohttp.ClientTimeout(total=10)) as s:
+        for _ in range(CFG["UnshortenHops"]):
+            check_public_url(url)
+            try:
+                async with s.get(url, allow_redirects=False) as r:
+                    status, loc = r.status, r.headers.get("Location")
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                raise UserError(f"Couldn't open `{clip(url, 80)}`.")
+            chain.append((status, url))
+            if status in (301, 302, 303, 307, 308) and loc:
+                url = urlparse(url)._replace(path="", query="", fragment="").geturl().rstrip("/") + loc \
+                    if loc.startswith("/") else loc
+                continue
+            break
+        else:
+            raise UserError(f"That link redirects more than {CFG['UnshortenHops']} times.")
+    final_status, final_url = chain[-1]
+    steps = "\n".join(f"`{st}` {clip(u, 90)}" for st, u in chain[:-1]) or "No redirects."
+    e = embed("Where it goes", f"**{clip(final_url, 500)}**")
+    e.add_field(name="Final status", value=str(final_status))
+    e.add_field(name="Hops", value=str(len(chain) - 1))
+    e.add_field(name="Path", value=steps, inline=False)
+    e.set_footer(text=f"{CFG['Footer']}  |  Redirects done by scripts or meta tags aren't followed")
+    await reply(interaction, e)
+
+
+# ================================================================
+# MUSIC: /spotify and /soundcloud
+# ================================================================
+
+SPOTIFY_URL = re.compile(r"open\.spotify\.com/(?:intl-[a-z]+/)?(track|album|artist|playlist|episode|show)/([A-Za-z0-9]+)")
+_spotify_token = {"value": "", "until": 0.0}
+
+
+async def spotify_api(kind: str, sid: str) -> Optional[dict]:
+    if not (CFG["SpotifyId"] and CFG["SpotifySecret"]):
+        return None
+    if time.time() > _spotify_token["until"]:
+        try:
+            s = await get_session()
+            async with s.post("https://accounts.spotify.com/api/token", data={"grant_type": "client_credentials"},
+                              auth=aiohttp.BasicAuth(CFG["SpotifyId"], CFG["SpotifySecret"])) as r:
+                if r.status != 200:
+                    return None
+                tok = await r.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return None
+        _spotify_token.update(value=tok["access_token"], until=time.time() + tok.get("expires_in", 3600) - 60)
+    return await http_json(f"https://api.spotify.com/v1/{kind}s/{sid}",
+                           headers={"Authorization": f"Bearer {_spotify_token['value']}"})
+
+
+@app_commands.command(name="spotify", description="Look up a Spotify track, album, artist or playlist by link")
+@app_commands.describe(link="open.spotify.com link")
+@guarded
+async def spotify_cmd(interaction: discord.Interaction, link: str):
+    m = SPOTIFY_URL.search(link)
+    if not m:
+        raise UserError("That isn't a Spotify link to a track, album, artist or playlist.")
+    kind, sid = m.groups()
+    url = f"https://open.spotify.com/{kind}/{sid}"
+    d = await spotify_api(kind, sid)
+    art = lambda x: ", ".join(a["name"] for a in x.get("artists", []))
+    img = lambda x: ((x.get("images") or x.get("album", {}).get("images") or [{}])[0]).get("url")
+    if d and kind == "track":
+        e = embed(clip(d["name"], 250), url=url)
+        e.add_field(name="Artist", value=clip(art(d), 200))
+        e.add_field(name="Album", value=clip(d["album"]["name"], 100))
+        e.add_field(name="Length", value=fmt_duration(d["duration_ms"] / 1000))
+        e.add_field(name="Released", value=d["album"].get("release_date", "n/a"))
+        e.add_field(name="Popularity", value=f"{d.get('popularity', 0)} / 100")
+        e.add_field(name="Explicit", value="Yes" if d.get("explicit") else "No")
+    elif d and kind == "album":
+        e = embed(clip(d["name"], 250), url=url)
+        e.add_field(name="Artist", value=clip(art(d), 200))
+        e.add_field(name="Released", value=d.get("release_date", "n/a"))
+        e.add_field(name="Tracks", value=str(d.get("total_tracks", "n/a")))
+    elif d and kind == "artist":
+        e = embed(clip(d["name"], 250), url=url)
+        e.add_field(name="Followers", value=num(d["followers"]["total"]))
+        e.add_field(name="Popularity", value=f"{d.get('popularity', 0)} / 100")
+        if d.get("genres"):
+            e.add_field(name="Genres", value=clip(", ".join(d["genres"][:5]), 200), inline=False)
+    elif d and kind == "playlist":
+        e = embed(clip(d["name"], 250), clip(d.get("description"), 300) or None, url=url)
+        e.add_field(name="Owner", value=clip(d["owner"].get("display_name") or "n/a", 60))
+        e.add_field(name="Tracks", value=num(d["tracks"]["total"]))
+        e.add_field(name="Followers", value=num(d["followers"]["total"]))
+    else:
+        data = await http_json("https://open.spotify.com/oembed", params={"url": url})
+        if not data:
+            raise UserError("Spotify didn't return that link. It may be private or removed.")
+        e = embed(clip(data["title"], 250), f"Spotify {kind}", url=url)
+        e.set_footer(text=f"{CFG['Footer']}  |  Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET for artist, album and more")
+        if data.get("thumbnail_url"):
+            e.set_thumbnail(url=data["thumbnail_url"])
+        await reply(interaction, e)
+        return
+    if img(d):
+        e.set_thumbnail(url=img(d))
+    await reply(interaction, e)
+
+
+@app_commands.command(name="soundcloud", description="Look up a SoundCloud track or playlist by link")
+@app_commands.describe(link="soundcloud.com link")
+@guarded
+async def soundcloud_cmd(interaction: discord.Interaction, link: str):
+    url = need_url(link)
+    if "soundcloud.com" not in urlparse(url).netloc:
+        raise UserError("That isn't a SoundCloud link.")
+    data = await http_json("https://soundcloud.com/oembed", params={"format": "json", "url": url})
+    if not data:
+        raise UserError("SoundCloud didn't return that link. It may be private or removed.")
+    e = embed(clip(data.get("title"), 250), clip(data.get("description"), 300) or None, url=url)
+    e.add_field(name="Artist", value=f"[{clip(data.get('author_name'), 60)}]({data.get('author_url')})")
+    if data.get("thumbnail_url"):
+        e.set_thumbnail(url=data["thumbnail_url"])
+    await reply(interaction, e)
+
+
+
+# ================================================================
 # REGISTER
 # ================================================================
 
@@ -746,6 +1436,9 @@ COMMANDS = [
     convert_cmd, resize_cmd, compress_cmd, gifmaker_cmd, audioconvert_cmd, waveform_cmd,
     youtube_cmd, tiktok_cmd, tweet_cmd, embedfix_cmd,
     github_cmd, weather_cmd, define_cmd, robloxstatus_cmd, qr_cmd, color_cmd,
+    filter_cmd, caption_cmd, gifframes_cmd, spritesheet_cmd, ocr_cmd, trim_cmd,
+    timestamp_cmd, currency_cmd, crypto_cmd, hash_cmd, base64_cmd, unshorten_cmd,
+    spotify_cmd, soundcloud_cmd,
 ]
 
 
