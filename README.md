@@ -219,3 +219,9 @@ anywhere, and log the account out everywhere if it ever leaks.
 - `/emoji file` creates a transparent 128×128 PNG.
 
 **Deployment:** Audio commands require the `ffmpeg` executable installed on the host and accessible on PATH. On Render, use a runtime/container with FFmpeg available. Input attachments are capped at 20 MB. Audio outputs are WAV; very long files may exceed Discord's upload limits. Commands sync globally on startup and may take time to appear.
+
+
+## Image GIF output
+Image-producing commands `/resize`, `/compress`, `/filter`, `/caption`, `/spritesheet`, `/palette`, `/imageinfo`, and `/emoji` support `togif:true`. This changes the returned image into GIF format. A still image becomes a single-frame GIF; it does **not** create motion. `/convert format:gif` already does the same conversion, so no redundant `togif` parameter is needed there. `/gifmaker` already creates animated GIFs. `/gifframes` is for extracting frames and `/ocr` is text-only.
+
+`/imageinfo strip:true togif:true` outputs a metadata-stripped GIF. The emoji command exports a 128×128 GIF when requested. `/thumbnail` no longer repeats `/avatar` functionality; `/avatar` remains the dedicated avatar command.

@@ -2115,7 +2115,7 @@ async def servers_cmd(interaction: discord.Interaction, game: str):
 
 @bot.tree.command(name="thumbnail", description="Full-size thumbnail of a Roblox asset, game, group or user")
 @app_commands.describe(kind="What kind of thing", target="Name, ID or link of it")
-async def thumbnail_cmd(interaction: discord.Interaction, kind: Literal["asset", "game", "group", "avatar", "headshot"],
+async def thumbnail_cmd(interaction: discord.Interaction, kind: Literal["asset", "game", "group", "headshot"],
                         target: str):
     await interaction.response.defer(thinking=True)
     rbx = bot.rbx
@@ -2128,14 +2128,14 @@ async def thumbnail_cmd(interaction: discord.Interaction, kind: Literal["asset",
         tid = await pick_group(interaction, target, strict=False)
         if not tid:
             return
-    elif kind in ("avatar", "headshot"):
+    elif kind == "headshot":
         u = await find_user(interaction, target)
         if not u:
             return
         tid, label = int(u["id"]), u.get("displayName") or u.get("name")
     else:
         tid = parse_id(target, "asset ID")
-    url = await rbx.big_thumbnail({"avatar": "user"}.get(kind, kind), tid)
+    url = await rbx.big_thumbnail(kind, tid)
     if not url:
         await show(interaction, error_embed("Roblox has no finished image for that yet. Try again in a few seconds.",
                                             "No thumbnail"))
@@ -2176,7 +2176,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/audiograb` download an audio file\n`/limited` RAP, value, demand\n"
         "`/usernamecheck` free or taken\n`/compare` two users or groups\n"
         "`/servers` players and server fill\n`/thumbnail` full-size images\n"
-        "`/robux` sale cut, DevEx and buy cost\n`/robloxstatus` is Roblox up"), inline=False)
+        "`/robux` sale cut, DevEx and buy cost\n`/dmca` copyright notice draft\n`/robloxstatus` is Roblox up"), inline=False)
     e.add_field(name="Alerts", value=(
         "`/watch audio` `/watch group` DM when something changes\n"
         "`/watch list` `/watch stop` manage them\n"
@@ -2184,7 +2184,8 @@ async def help_cmd(interaction: discord.Interaction):
     e.add_field(name="Convert", value=(
         "`/convert` `/resize` `/compress` `/filter` `/caption` images\n"
         "`/gifmaker` images to a GIF, `/gifframes` GIF to frames, `/spritesheet`\n"
-        "`/audioconvert` `/trim` `/waveform` audio\n`/ocr` text from an image"), inline=False)
+        "`/audioconvert` `/trim` `/waveform` audio\n`/normalize` `/speed` `/pitch` `/silence` audio\n`/palette` `/imageinfo` `/emoji` images\n`/ocr` text from an image\n"
+        "Image commands support `togif:true` (where available); `/imageinfo strip:true` removes metadata"), inline=False)
     e.add_field(name="Links and lookups", value=(
         "`/youtube` `/tiktok` `/tweet` `/spotify` `/soundcloud` `/github`\n"
         "`/embedfix` make social links embed, `/unshorten` where a short link goes"), inline=False)

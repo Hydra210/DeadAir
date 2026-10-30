@@ -356,6 +356,22 @@ def image_result(title: str, desc: str, data: bytes, name: str, fmt: str) -> tup
     return e, f
 
 
+def gif_output(data: bytes, name: str, fmt: str, togif: bool):
+    if not togif or fmt == 'gif':
+        return data, name, fmt
+    im = Image.open(io.BytesIO(data))
+    frames, durations = [], []
+    count = min(getattr(im, 'n_frames', 1), 120)
+    for i in range(count):
+        im.seek(i)
+        frame = im.convert('RGBA')
+        frame.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+        frames.append(frame)
+        durations.append(max(20, im.info.get('duration', 100)))
+    out = io.BytesIO()
+    frames[0].save(out, 'GIF', save_all=True, append_images=frames[1:], duration=durations, loop=0)
+    return out.getvalue(), name.rsplit('.', 1)[0] + '.gif', 'gif'
+
 @app_commands.command(name="convert", description="Convert an image to another format (png, jpg, webp, gif, ico...)")
 @app_commands.describe(file="The image to convert", format="What to turn it into")
 @guarded
@@ -377,13 +393,14 @@ async def convert_cmd(interaction: discord.Interaction, file: discord.Attachment
 async def resize_cmd(interaction: discord.Interaction, file: discord.Attachment,
                      width: Optional[app_commands.Range[int, 1, 4096]] = None,
                      height: Optional[app_commands.Range[int, 1, 4096]] = None,
-                     percent: Optional[app_commands.Range[int, 1, 800]] = None):
+                     percent: Optional[app_commands.Range[int, 1, 800]] = None, togif: bool = False):
     data = await read_attachment(file, "image")
     ext = (file.filename.rsplit(".", 1)[-1] or "png").lower()
     fmt = {"jpeg": "jpg", "tif": "tiff"}.get(ext, ext)
     fmt = fmt if fmt in IMAGE_FORMATS else "png"
     out, (w, h) = await heavy(resize_image, data, width, height, percent, fmt)
     name = f"{stem(file)}_{w}x{h}.{IMAGE_FORMATS[fmt][1]}"
+    out, name, fmt = gif_output(out, name, fmt, togif)
     e, f = image_result("Resized", f"`{file.filename}` is now {w} x {h}. {human_size(len(out))}.", out, name, fmt)
     await reply(interaction, e, f)
 
@@ -392,10 +409,11 @@ async def resize_cmd(interaction: discord.Interaction, file: discord.Attachment,
 @app_commands.describe(file="The image to compress", target_mb="Size to aim for in MB (default 1)")
 @guarded
 async def compress_cmd(interaction: discord.Interaction, file: discord.Attachment,
-                       target_mb: app_commands.Range[float, 0.05, 9.0] = 1.0):
+                       target_mb: app_commands.Range[float, 0.05, 9.0] = 1.0, togif: bool = False):
     data = await read_attachment(file, "image")
     out, ext, quality = await heavy(compress_image, data, int(target_mb * 1024 * 1024))
     name = f"{stem(file)}_small.{ext}"
+    out, name, fmt = gif_output(out, name, fmt, togif)
     e, f = image_result("Compressed", f"{human_size(len(data))} to {human_size(len(out))} "
                                       f"(quality {quality}, `{ext}`).", out, name, ext)
     await reply(interaction, e, f)
@@ -903,11 +921,12 @@ def png_bytes(img: Image.Image) -> bytes:
 async def filter_cmd(interaction: discord.Interaction, file: discord.Attachment,
                      effect: Literal["grayscale", "invert", "sepia", "blur", "sharpen", "pixelate", "mirror",
                                      "flip", "rotate90", "rotate180", "rotate270"],
-                     strength: app_commands.Range[int, 1, 10] = 5):
+                     strength: app_commands.Range[int, 1, 10] = 5, togif: bool = False):
     data = await read_attachment(file, "image")
     fmt = input_format(file)
     out = await heavy(transform_image, data, fmt, lambda f: apply_effect(f, effect, strength))
     name = f"{stem(file)}_{effect}.{IMAGE_FORMATS[fmt][1]}"
+    out, name, fmt = gif_output(out, name, fmt, togif)
     e, f = image_result("Filter applied", f"`{effect}` on `{file.filename}`. {human_size(len(out))}.", out, name, fmt)
     await reply(interaction, e, f)
 
@@ -916,13 +935,14 @@ async def filter_cmd(interaction: discord.Interaction, file: discord.Attachment,
 @app_commands.describe(file="The image", text="Text for the top, or 'top text | bottom text'")
 @guarded
 async def caption_cmd(interaction: discord.Interaction, file: discord.Attachment,
-                      text: app_commands.Range[str, 1, 200]):
+                      text: app_commands.Range[str, 1, 200], togif: bool = False):
     top, _, bottom = text.partition("|")
     top, bottom = top.strip(), bottom.strip()
     data = await read_attachment(file, "image")
     fmt = input_format(file)
     out = await heavy(transform_image, data, fmt, lambda f: draw_caption(f, top, bottom))
     name = f"{stem(file)}_caption.{IMAGE_FORMATS[fmt][1]}"
+    out, name, fmt = gif_output(out, name, fmt, togif)
     e, f = image_result("Captioned", f"{human_size(len(out))}.", out, name, fmt)
     await reply(interaction, e, f)
 
@@ -964,7 +984,7 @@ async def spritesheet_cmd(interaction: discord.Interaction, image1: discord.Atta
                           image2: Optional[discord.Attachment] = None, image3: Optional[discord.Attachment] = None,
                           image4: Optional[discord.Attachment] = None, image5: Optional[discord.Attachment] = None,
                           image6: Optional[discord.Attachment] = None,
-                          columns: Optional[app_commands.Range[int, 1, 6]] = None):
+                          columns: Optional[app_commands.Range[int, 1, 6]] = None, togif: bool = False):
     picked = [a for a in (image1, image2, image3, image4, image5, image6) if a]
     if len(picked) < 2:
         raise UserError("A sheet needs at least two images.")
@@ -981,8 +1001,9 @@ async def spritesheet_cmd(interaction: discord.Interaction, image1: discord.Atta
         return png_bytes(split_frames_to_sheet(frames, cols, cell))
 
     out = await heavy(work)
+    out, output_name, output_fmt = gif_output(out, "spritesheet.png", "png", togif)
     e, f = image_result("Sprite sheet", f"{len(picked)} images, each fitted to the size of the first. "
-                                        f"{human_size(len(out))}.", out, "spritesheet.png", "png")
+                                        f"{human_size(len(out))}.", out, output_name, output_fmt)
     await reply(interaction, e, f)
 
 

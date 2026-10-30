@@ -27,6 +27,16 @@ async def ffmpeg(data, args, suffix='wav'):
     if len(out)>24*1024*1024: raise ValueError('Output too large for Discord. Try a shorter file.')
     return discord.File(io.BytesIO(out),filename='deadair.'+suffix)
 
+def as_gif(image):
+    """Export the displayed image as a GIF (single frame for still images)."""
+    image.seek(0)
+    image = ImageOps.exif_transpose(image).convert('RGBA')
+    image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+    output = io.BytesIO()
+    image.save(output, format='GIF')
+    output.seek(0)
+    return discord.File(output, filename='deadair.gif')
+
 def register(bot):
     async def execute(interaction, operation):
         await interaction.response.defer(thinking=True)
@@ -83,7 +93,7 @@ def register(bot):
         await execute(interaction,run)
 
     @bot.tree.command(name='palette',description='Extract dominant colors and HEX swatches from an image.')
-    async def palette(interaction:discord.Interaction,file:discord.Attachment,colors:app_commands.Range[int,2,10]=6):
+    async def palette(interaction:discord.Interaction,file:discord.Attachment,colors:app_commands.Range[int,2,10]=6,togif:bool=False):
         async def run():
             im=Image.open(io.BytesIO(await read_attachment(file))).convert('RGB');im.thumbnail((300,300))
             quant=im.quantize(colors=colors,method=Image.Quantize.MEDIANCUT)
@@ -95,11 +105,11 @@ def register(bot):
                 draw.rectangle((0,i*60,120,(i+1)*60),fill=rgb)
                 draw.text((140,i*60+20),hexcode,fill='black');lines.append(hexcode)
             out=io.BytesIO();sw.save(out,'PNG');out.seek(0)
-            return ('palette',{'content':'Dominant colors: '+', '.join(lines),'file':discord.File(out,filename='palette.png')})
+            return ('palette',{'content':'Dominant colors: '+', '.join(lines),'file':as_gif(sw) if togif else discord.File(out,filename='palette.png')})
         await execute(interaction,run)
 
     @bot.tree.command(name='imageinfo',description='Inspect image dimensions, format, EXIF, or strip metadata.')
-    async def imageinfo(interaction:discord.Interaction,file:discord.Attachment,strip:bool=False):
+    async def imageinfo(interaction:discord.Interaction,file:discord.Attachment,strip:bool=False,togif:bool=False):
         async def run():
             im=Image.open(io.BytesIO(await read_attachment(file)))
             if im.width*im.height>60_000_000: raise ValueError('Image dimensions too large.')
@@ -109,22 +119,22 @@ def register(bot):
                 if im.mode not in ('RGB','RGBA'):im=im.convert('RGBA')
                 clean=Image.new(im.mode,im.size);clean.paste(im)
                 out=io.BytesIO();clean.save(out,format='PNG');out.seek(0)
-                return discord.File(out,filename='metadata_removed.png')
+                return as_gif(clean) if togif else discord.File(out,filename='metadata_removed.png')
             exif=im.getexif();fields=[]
             for k,v in list(exif.items())[:15]:
                 key=ExifTags.TAGS.get(k,str(k))
                 if key=='GPSInfo': v='[location data present — hidden]'
                 fields.append(f'{key}: {str(v)[:100]}')
-            return f'**{im.width} × {im.height}** pixels | **{im.format}** | **{im.mode}**\nEXIF tags: {len(exif)}\n'+('\n'.join(fields) if fields else 'No EXIF tags found.')
+            return ('imageinfo', {'content':f'**{im.width} × {im.height}** pixels | **{im.format}** | **{im.mode}**\nEXIF tags: {len(exif)}\n'+('\n'.join(fields) if fields else 'No EXIF tags found.'), 'file':as_gif(im)}) if togif else f'**{im.width} × {im.height}** pixels | **{im.format}** | **{im.mode}**\nEXIF tags: {len(exif)}\n'+('\n'.join(fields) if fields else 'No EXIF tags found.')
         await execute(interaction,run)
 
     @bot.tree.command(name='emoji',description='Resize an image to a 128×128 transparent Discord emoji PNG.')
-    async def emoji(interaction:discord.Interaction,file:discord.Attachment):
+    async def emoji(interaction:discord.Interaction,file:discord.Attachment,togif:bool=False):
         async def run():
             im=Image.open(io.BytesIO(await read_attachment(file))).convert('RGBA')
             if im.width*im.height>60_000_000: raise ValueError('Image dimensions too large.')
             im.thumbnail((128,128),Image.Resampling.LANCZOS)
             canvas=Image.new('RGBA',(128,128),(0,0,0,0));canvas.alpha_composite(im,((128-im.width)//2,(128-im.height)//2))
             out=io.BytesIO();canvas.save(out,'PNG',optimize=True);out.seek(0)
-            return discord.File(out,filename='emoji.png')
+            return as_gif(canvas) if togif else discord.File(out,filename='emoji.png')
         await execute(interaction,run)
