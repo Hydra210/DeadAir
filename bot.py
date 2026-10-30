@@ -22,6 +22,7 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 import audio
+import toolkit
 from roblox import (AuthError, ChallengeRequired, GroupInfo, RobloxClient,
                     RobloxError, status_to_working)
 
@@ -211,6 +212,7 @@ class DeadAir(discord.Client):
 
     async def close(self):
         self.status_loop.cancel()
+        await toolkit.close()
         if self.rbx:
             await self.rbx.close()
         if self.health:
@@ -1737,6 +1739,11 @@ for _cmd in (members_cmd, groupgames_cmd, membership_cmd):
     _cmd.autocomplete("group")(group_autocomplete)
 
 
+# ---------- converters, social lookups, utilities (toolkit.py) ----------
+
+toolkit.register(bot)
+
+
 # ---------- help ----------
 
 @bot.tree.command(name="help", description="List everything DeadAir can do")
@@ -1757,6 +1764,15 @@ async def help_cmd(interaction: discord.Interaction):
     e.add_field(name="Games and items", value=(
         "`/game` game card\n`/gamepasses` `/gamebadges` passes and badges for a game\n"
         "`/asset` any asset by ID\n`/badge` badge by ID"), inline=False)
+    e.add_field(name="Convert", value=(
+        "`/convert` image to png, jpg, webp, gif, ico...\n`/resize` `/compress` image size and file size\n"
+        "`/gifmaker` up to 6 images into an animated GIF\n"
+        "`/audioconvert` mp3, wav, flac, ogg\n`/waveform` loudness stats and waveform for any audio file"), inline=False)
+    e.add_field(name="Socials", value=(
+        "`/youtube` `/tiktok` `/tweet` link lookups\n"
+        "`/embedfix` make TikTok, Instagram, X and Reddit links embed properly"), inline=False)
+    e.add_field(name="Tools", value=(
+        "`/robloxstatus` is Roblox up\n`/github` user or repo\n`/weather` `/define` `/qr` `/color`"), inline=False)
     e.add_field(name="Bot", value="`/join` make the bot's account join a group\n`/whoami` which account the bot uses",
                 inline=False)
     await interaction.response.send_message(embed=e, ephemeral=True)

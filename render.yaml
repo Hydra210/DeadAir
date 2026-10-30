@@ -18,3 +18,7 @@ services:
         sync: false          # enter these in the dashboard, never commit them
       - key: ROBLOX_COOKIE
         sync: false
+      - key: YOUTUBE_API_KEY   # optional, adds views/likes/search to /youtube
+        sync: false
+      - key: GITHUB_TOKEN      # optional, raises the /github rate limit
+        sync: false

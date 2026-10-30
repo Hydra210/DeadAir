@@ -4,3 +4,4 @@ python-dotenv>=1.0
 soundfile>=0.12.1
 numpy>=1.26
 pillow>=10.1
+qrcode>=7.4

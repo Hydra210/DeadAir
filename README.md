@@ -47,6 +47,32 @@ needs an exact name or an ID, and shows suggestions otherwise.
 | `/gamepasses` / `/gamebadges` | A game's passes with prices, or its badges with award counts |
 | `/asset` / `/badge` | Any asset or badge by ID |
 
+**Convert** (attach a file to the command, up to 25 MB)
+
+| Command | What it does |
+|---|---|
+| `/convert file format` | Image to png, jpg, webp, gif, bmp, ico or tiff. Animated gif/webp keep their frames when going to gif or webp |
+| `/resize file [width] [height] [percent]` | Resize an image, keeps the aspect ratio if you give only one side |
+| `/compress file [target_mb]` | Shrinks an image until it fits the size you want |
+| `/gifmaker image1 ... image6 [delay] [loop]` | Turns 2 to 6 images into an animated GIF |
+| `/audioconvert file format` | Audio between mp3, wav, flac and ogg |
+| `/waveform file` | Length, peak, average loudness and the same black-and-white waveform `/check` makes, for any audio file |
+
+**Socials and lookups**
+
+| Command | What it does |
+|---|---|
+| `/youtube video` | Title, channel and thumbnail from a link. With `YOUTUBE_API_KEY` set it also shows views, likes, length, date, and accepts search words |
+| `/tiktok link` | Title, creator and thumbnail |
+| `/tweet link` | Post text, author, likes, reposts, views and the first image |
+| `/embedfix link` | Rewrites TikTok, Instagram, X and Reddit links to a host that makes Discord show the real embed |
+| `/robloxstatus` | Whether Roblox is up, with any open incidents |
+| `/github target` | A user or `owner/repo`. `GITHUB_TOKEN` (optional) lifts the 60 per hour limit |
+| `/weather` `/define` `/qr` `/color` | Weather for a city, dictionary definition, QR code, color swatch |
+
+Instagram has no public lookup that works without a login, so `/embedfix` is how Instagram links are handled.
+All of this lives in `toolkit.py`. To add a command, write it there and add it to the `COMMANDS` list.
+
 **Bot:** `/join group`, `/whoami`, `/help`.
 
 Lists of people (`/followers`, `/following`, `/members`) can be huge, so the first batch loads right away and the
