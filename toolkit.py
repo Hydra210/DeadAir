@@ -201,10 +201,11 @@ async def read_attachment(att: discord.Attachment, kind: str) -> bytes:
     return await att.read()
 
 
-def out_file(data: bytes, name: str) -> discord.File:
-    if len(data) > CFG["MaxOutputBytes"]:
-        raise UserError(f"The result is {human_size(len(data))}, which is over Discord's upload limit. "
-                        "Try `/compress` or `/resize` first.")
+def out_file(data: bytes, name: str, max_bytes: Optional[int] = None) -> discord.File:
+    limit = CFG["MaxOutputBytes"] if max_bytes is None else max_bytes
+    if len(data) > limit:
+        raise UserError(f"The result is {human_size(len(data))}, but this interaction allows "
+                        f"{human_size(limit)}. Try a smaller scale or turn off GIF output.")
     return discord.File(io.BytesIO(data), filename=name)
 
 
@@ -348,9 +349,10 @@ def stem(att: discord.Attachment) -> str:
     return re.sub(r"[^\w\-]+", "_", att.filename.rsplit(".", 1)[0])[:40] or "file"
 
 
-def image_result(title: str, desc: str, data: bytes, name: str, fmt: str) -> tuple[discord.Embed, discord.File]:
+def image_result(title: str, desc: str, data: bytes, name: str, fmt: str,
+                 max_bytes: Optional[int] = None) -> tuple[discord.Embed, discord.File]:
     e = embed(title, desc)
-    f = out_file(data, name)
+    f = out_file(data, name, max_bytes)
     if fmt in INLINE_PREVIEW:
         e.set_image(url=f"attachment://{name}")
     return e, f
@@ -405,25 +407,34 @@ async def resize_cmd(interaction: discord.Interaction, file: discord.Attachment,
     await reply(interaction, e, f)
 
 
-@app_commands.command(name="large", description="Enlarge an image or animated GIF by a percentage")
-@app_commands.describe(file="The image or GIF to enlarge", percent="How large to make it (101% to 800%)")
+@app_commands.command(name="large", description="Scale an image or GIF from 0.5x to 3x")
+@app_commands.describe(
+    file="The image or GIF to scale",
+    scale="Size multiplier (0.5x = half size, 3x = triple size)",
+    togif="Convert the result to GIF (animated inputs keep their frames)",
+)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
 @guarded
 async def large_cmd(interaction: discord.Interaction, file: discord.Attachment,
-                    percent: app_commands.Range[int, 101, 800]):
+                    scale: app_commands.Range[float, 0.5, 3.0], togif: bool = False):
     data = await read_attachment(file, "image")
     ext = (file.filename.rsplit(".", 1)[-1] or "png").lower()
-    fmt = {"jpeg": "jpg", "tif": "tiff"}.get(ext, ext)
+    fmt = "gif" if togif else {"jpeg": "jpg", "tif": "tiff"}.get(ext, ext)
     fmt = fmt if fmt in IMAGE_FORMATS else "png"
+    percent = round(scale * 100)
     out, (w, h) = await heavy(resize_image, data, None, None, percent, fmt)
-    name = f"{stem(file)}_{percent}pct.{IMAGE_FORMATS[fmt][1]}"
+    name = f"{stem(file)}_{scale:g}x.{IMAGE_FORMATS[fmt][1]}"
     animated = fmt in ANIMATED_OK and getattr(open_image(data), "is_animated", False)
     note = " Animation frames preserved." if animated else ""
+    # Discord supplies the effective upload cap for this interaction. Keep a
+    # little headroom and cap at the documented 20 MiB default/API request size.
+    reported_limit = getattr(interaction, "filesize_limit", 20 * 1024 * 1024)
+    output_limit = max(1, min(int(reported_limit), 20 * 1024 * 1024) - 512 * 1024)
     e, f = image_result(
-        "Image enlarged",
-        f"`{file.filename}` enlarged to **{percent}%** ({w} × {h}). {human_size(len(out))}.{note}",
-        out, name, fmt)
+        "Image scaled",
+        f"`{file.filename}` scaled to **{scale:g}x** ({w} × {h}). {human_size(len(out))}.{note}",
+        out, name, fmt, max_bytes=output_limit)
     await reply(interaction, e, f)
 
 
