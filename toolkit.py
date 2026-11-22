@@ -407,6 +407,8 @@ async def resize_cmd(interaction: discord.Interaction, file: discord.Attachment,
 
 @app_commands.command(name="large", description="Enlarge an image or animated GIF by a percentage")
 @app_commands.describe(file="The image or GIF to enlarge", percent="How large to make it (101% to 800%)")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
 @guarded
 async def large_cmd(interaction: discord.Interaction, file: discord.Attachment,
                     percent: app_commands.Range[int, 101, 800]):
