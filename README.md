@@ -79,7 +79,7 @@ Alerts arrive as a DM from the bot, so test with `/remind add when:in 1m message
 |---|---|
 | `/convert file format` | Image to png, jpg, webp, gif, bmp, ico or tiff. Animated gif/webp keep their frames when going to gif or webp |
 | `/resize file [width] [height] [percent]` | Resize an image, keeps the aspect ratio if you give only one side |
-| `/large file percent` | Enlarge an image or animated GIF by a percentage (101%–800%); GIF/WebP animation is preserved |
+| `/large file scale [togif]` | Scale an image or GIF from 0.5x to 3x; optionally convert the result to GIF. Animation frames are preserved for GIF/WebP output. |
 | `/compress file [target_mb]` | Shrinks an image until it fits the size you want |
 | `/gifmaker image1 ... image6 [delay] [loop]` | Turns 2 to 6 images into an animated GIF |
 | `/filter file effect [strength]` | grayscale, invert, sepia, blur, sharpen, pixelate, mirror, flip, rotate. GIFs keep animating |
