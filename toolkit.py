@@ -405,6 +405,26 @@ async def resize_cmd(interaction: discord.Interaction, file: discord.Attachment,
     await reply(interaction, e, f)
 
 
+@app_commands.command(name="large", description="Enlarge an image or animated GIF by a percentage")
+@app_commands.describe(file="The image or GIF to enlarge", percent="How large to make it (101% to 800%)")
+@guarded
+async def large_cmd(interaction: discord.Interaction, file: discord.Attachment,
+                    percent: app_commands.Range[int, 101, 800]):
+    data = await read_attachment(file, "image")
+    ext = (file.filename.rsplit(".", 1)[-1] or "png").lower()
+    fmt = {"jpeg": "jpg", "tif": "tiff"}.get(ext, ext)
+    fmt = fmt if fmt in IMAGE_FORMATS else "png"
+    out, (w, h) = await heavy(resize_image, data, None, None, percent, fmt)
+    name = f"{stem(file)}_{percent}pct.{IMAGE_FORMATS[fmt][1]}"
+    animated = fmt in ANIMATED_OK and getattr(open_image(data), "is_animated", False)
+    note = " Animation frames preserved." if animated else ""
+    e, f = image_result(
+        "Image enlarged",
+        f"`{file.filename}` enlarged to **{percent}%** ({w} × {h}). {human_size(len(out))}.{note}",
+        out, name, fmt)
+    await reply(interaction, e, f)
+
+
 @app_commands.command(name="compress", description="Shrink an image's file size so it fits an upload limit")
 @app_commands.describe(file="The image to compress", target_mb="Size to aim for in MB (default 1)")
 @guarded
@@ -1454,7 +1474,7 @@ async def soundcloud_cmd(interaction: discord.Interaction, link: str):
 # ================================================================
 
 COMMANDS = [
-    convert_cmd, resize_cmd, compress_cmd, gifmaker_cmd, audioconvert_cmd, waveform_cmd,
+    convert_cmd, resize_cmd, large_cmd, compress_cmd, gifmaker_cmd, audioconvert_cmd, waveform_cmd,
     youtube_cmd, tiktok_cmd, tweet_cmd, embedfix_cmd,
     github_cmd, weather_cmd, define_cmd, robloxstatus_cmd, qr_cmd, color_cmd,
     filter_cmd, caption_cmd, gifframes_cmd, spritesheet_cmd, ocr_cmd, trim_cmd,
