@@ -210,7 +210,6 @@ anywhere, and log the account out everywhere if it ever leaks.
 
 ## Additional commands
 
-- `/dmca asset_id owner work claim contact` creates a private copyright takedown **draft** as a text file. Review and sign it before submitting it yourself; the bot does not send legal notices.
 - `/normalize file target_lufs` applies FFmpeg loudness normalization (default -16 LUFS).
 - `/speed file multiplier` changes speed while approximately preserving pitch.
 - `/pitch file semitones` shifts pitch while approximately preserving duration.
