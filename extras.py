@@ -4,7 +4,6 @@ import io
 import math
 import re
 from collections import Counter
-from datetime import datetime, timezone
 from PIL import Image, ImageOps, ImageDraw, ExifTags
 import discord
 from discord import app_commands
@@ -47,19 +46,6 @@ def register(bot):
             else: await interaction.followup.send(result)
         except (ValueError, OSError, discord.HTTPException) as e:
             await interaction.followup.send('Error: '+str(e)[:1500],ephemeral=True)
-
-    @bot.tree.command(name='dmca',description='Prepare a Roblox copyright takedown notice draft (not submitted).')
-    @app_commands.describe(asset_id='Roblox asset ID',owner='Your legal name or copyright owner',work='Description of your original copyrighted work',claim='How this Roblox asset infringes your work',contact='Your contact email for the notice')
-    async def dmca(interaction:discord.Interaction,asset_id:str,owner:str,work:str,claim:str,contact:str):
-        if not asset_id.isdecimal() or len(asset_id)>20:
-            await interaction.response.send_message('Please enter a valid numeric asset ID.',ephemeral=True);return
-        body=(f'Copyright takedown notice — DRAFT ONLY\n\nRoblox asset: https://www.roblox.com/library/{asset_id}\nCopyright owner: {owner}\nOriginal copyrighted work: {work}\nClaim of infringement: {claim}\nContact: {contact}\n\n'
-              'Required declarations to review and affirm if true:\n'
-              'I have a good-faith belief that the disputed use is not authorized by the copyright owner, its agent, or the law.\n'
-              'I state under penalty of perjury that the information in this notice is accurate and that I am the copyright owner or authorized to act on the owner’s behalf.\n\n'
-              'Electronic signature: [ADD YOUR SIGNATURE]\nDate: '+datetime.now(timezone.utc).strftime('%Y-%m-%d')+'\n\n'
-              'Review accuracy, add your mailing address and signature, and submit through Roblox’s official copyright process. No notice has been sent.')
-        await interaction.response.send_message(file=discord.File(io.BytesIO(body.encode()),filename='dmca_draft.txt'),ephemeral=True)
 
     @bot.tree.command(name='normalize',description='Normalize audio to a target integrated loudness.')
     async def normalize(interaction:discord.Interaction,file:discord.Attachment,target_lufs:app_commands.Range[float,-30,-8]=-16):
