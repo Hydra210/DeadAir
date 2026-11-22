@@ -2208,7 +2208,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/audiograb` download an audio file\n`/limited` RAP, value, demand\n"
         "`/usernamecheck` free or taken\n`/compare` two users or groups\n"
         "`/servers` players and server fill\n`/thumbnail` full-size images\n"
-        "`/robux` sale cut, DevEx and buy cost\n`/dmca` copyright notice draft\n`/robloxstatus` is Roblox up"), inline=False)
+        "`/robux` sale cut, DevEx and buy cost\n`/robloxstatus` is Roblox up"), inline=False)
     e.add_field(name="Alerts", value=(
         "`/watch audio` `/watch group` DM when something changes\n"
         "`/watch list` `/watch stop` manage them\n"
